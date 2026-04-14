@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use reqwest::Client;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use serenity::all::CreateMessage;
 use crate::database::{db_get_url, db_save_url, is_whitelisted};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -56,22 +58,30 @@ pub enum Action {
 
 lazy_static! {
     static ref URL_REGEX: Regex = Regex::new(
-        r"https?://[^\s]+"
+        r"(?i)(https?://)?(?:www\.)?([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?:/[^\s]*)?"
     ).unwrap();
 }
 
 pub struct URLExtractor;
 
 impl URLExtractor {
-    /// استخراج جميع الروابط من الرسالة
+    /// استخراج جميع الروابط من الرسالة وتطبيع البروتوكول
     pub fn extract_urls(text: &str) -> Vec<String> {
         URL_REGEX
             .find_iter(text)
-            .map(|m| m.as_str().to_string())
+            .map(|m| {
+                let raw = m.as_str();
+                if raw.to_lowercase().starts_with("http://") || raw.to_lowercase().starts_with("https://") {
+                    raw.to_string()
+                } else {
+                    format!("https://{}", raw)
+                }
+            })
             .collect()
     }
 
     /// هل الرسالة تحتوي على روابط؟
+    #[allow(dead_code)]
     pub fn has_urls(text: &str) -> bool {
         !Self::extract_urls(text).is_empty()
     }
@@ -141,7 +151,29 @@ impl RiskScorer {
     }
 
     fn is_ip_based(url: &str) -> bool {
-        url.contains("192.168.") || url.contains("10.") || url.contains("172.")
+        // استخراج الجزء بعد http(s)://
+        let host = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+
+        // كشف IPv4: أربعة أقسام من الأرقام مفصولة بنقاط
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() == 4 {
+            return parts.iter().all(|p| p.parse::<u8>().is_ok());
+        }
+
+        // كشف IPv6: يبدأ بـ [
+        if host.starts_with('[') {
+            return true;
+        }
+
+        false
     }
 
     fn has_suspicious_protocol(url: &str) -> bool {
@@ -276,6 +308,7 @@ struct GoogleResponse {
 
 #[derive(Debug, Deserialize)]
 struct GoogleMatch {
+    #[allow(dead_code)]
     threat_type: String,
 }
 
@@ -511,12 +544,10 @@ impl LinkSecurityEngine {
         let mut risk_score = RiskScorer::calculate(url);
 
         // Level 1: Google Safe Browsing
-        let mut google_flagged = false;
         if let Some(ref google) = self.google {
             match google.check(url).await {
                 Ok(is_safe) => {
                     if !is_safe {
-                        google_flagged = true;
                         let result = LinkCheckResult {
                             url: url.to_string(),
                             level: SecurityLevel::Blacklist,
@@ -535,35 +566,33 @@ impl LinkSecurityEngine {
             }
         }
 
-        // Level 2: VirusTotal — يفحص كل رابط غريب (مو في whitelist)
-        if !google_flagged {
-            if let Some(ref vt) = self.virustotal {
-                let vt_start = Instant::now();
-                match vt.check(url).await {
-                    Ok(is_safe) => {
-                        println!("[VIRUSTOTAL] ⏱️ {}ms | {} | {}",
-                            vt_start.elapsed().as_millis(),
-                            url,
-                            if is_safe { "✅ آمن" } else { "🚨 خطر" }
-                        );
-                        if !is_safe {
-                            let result = LinkCheckResult {
-                                url: url.to_string(),
-                                level: SecurityLevel::Blacklist,
-                                risk_score: 0.9,
-                                is_safe: false,
-                                reason: "VirusTotal: الرابط خطر".to_string(),
-                            };
-                            self.save(&result).await;
-                            LinkCache::set(url, result.clone(), self.cache_ttl);
-                            return result;
-                        }
-                        risk_score = (risk_score * 0.5).min(0.3);
+        // Level 2: VirusTotal — إذا وصلنا هنا فـ Google لم يحظر الرابط
+        if let Some(ref vt) = self.virustotal {
+            let vt_start = Instant::now();
+            match vt.check(url).await {
+                Ok(is_safe) => {
+                    println!("[VIRUSTOTAL] ⏱️ {}ms | {} | {}",
+                        vt_start.elapsed().as_millis(),
+                        url,
+                        if is_safe { "✅ آمن" } else { "🚨 خطر" }
+                    );
+                    if !is_safe {
+                        let result = LinkCheckResult {
+                            url: url.to_string(),
+                            level: SecurityLevel::Blacklist,
+                            risk_score: 0.9,
+                            is_safe: false,
+                            reason: "VirusTotal: الرابط خطر".to_string(),
+                        };
+                        self.save(&result).await;
+                        LinkCache::set(url, result.clone(), self.cache_ttl);
+                        return result;
                     }
-                    Err(e) => {
-                        println!("[VIRUSTOTAL] {}", e);
-                        risk_score = (risk_score + 0.3).min(1.0);
-                    }
+                    risk_score = (risk_score * 0.5).min(0.3);
+                }
+                Err(e) => {
+                    println!("[VIRUSTOTAL] {}", e);
+                    risk_score = (risk_score + 0.3).min(1.0);
                 }
             }
         }
@@ -663,9 +692,50 @@ impl LinkSecurityEngine {
 // 🔌 DISCORD INTEGRATION
 // ═══════════════════════════════════════════════════════════════════════
 
+// نظام Rate Limiting لحماية API من البريد المزعج
+static RATE_LIMIT: Lazy<DashMap<u64, Instant>> = Lazy::new(DashMap::new);
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
+
+// dedup لمنع معالجة نفس الرسالة مرتين
+static SEEN_MESSAGES: Lazy<DashMap<u64, Instant>> = Lazy::new(DashMap::new);
+
+fn is_rate_limited(user_id: u64) -> bool {
+    let now = Instant::now();
+    if let Some(last) = RATE_LIMIT.get(&user_id) {
+        if now.duration_since(*last) < RATE_LIMIT_COOLDOWN {
+            return true;
+        }
+    }
+    RATE_LIMIT.insert(user_id, now);
+    false
+}
+
+/// تنظيف دوري: حذف المدخلات المنتهية من الذاكرة تجنباً لتراكم غير محدود
+fn cleanup_rate_limit() {
+    let now = Instant::now();
+    RATE_LIMIT.retain(|_, last| now.duration_since(*last) < Duration::from_secs(60));
+    SEEN_MESSAGES.retain(|_, last| now.duration_since(*last) < Duration::from_secs(10));
+}
+
 pub async fn handle_message(ctx: &Context, msg: &Message, engine: &LinkSecurityEngine) {
     if msg.author.bot { return; }
-    
+
+    // تنظيف دوري للذاكرة
+    cleanup_rate_limit();
+
+    // Rate Limiting: تجاهل المستخدم إذا أرسل روابط بسرعة كبيرة
+    let user_id = msg.author.id.get();
+    if is_rate_limited(user_id) {
+        println!("[RATE LIMIT] تم تجاهل السكان لـ user_id={}", user_id);
+        return;
+    }
+
+    // Dedup: تجاهل نفس الرسالة إذا عولجت مسبقاً (Discord أحياناً يرسل event مرتين)
+    let msg_id = msg.id.get();
+    if SEEN_MESSAGES.insert(msg_id, Instant::now()).is_some() {
+        return;
+    }
+
     println!("[MSG] from={} content={:?}", msg.author.name, msg.content);
 
     match engine.scan_message(msg).await {
@@ -673,9 +743,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message, engine: &LinkSecurityE
             let _ = msg.delete(ctx).await;
             // إرسال تنبيه خاص
             if let Ok(dm) = msg.author.create_dm_channel(ctx).await {
-                let _ = dm.send_message(ctx, |m| {
-                    m.content("🛡️ تم حذف رسالتك لأنها تحتوي على روابط خطيرة")
-                }).await;
+                let _ = dm.id.send_message(&ctx.http, CreateMessage::new().content("🛡️ تم حذف رسالتك لأنها تحتوي على روابط خطيرة")).await;
             }
         }
         Some(Action::Warn) => {

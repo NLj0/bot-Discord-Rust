@@ -1,13 +1,13 @@
 use serenity::async_trait;
-use serenity::client::Client;
+use serenity::model::application::{Command, CommandOptionType, Interaction};
 use serenity::model::gateway::Ready;
-use serenity::model::interactions::Interaction;
-use serenity::model::interactions::InteractionResponseType;
+use serenity::model::id::GuildId;
 use serenity::model::prelude::Message;
+use serenity::builder::{CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage};
 use serenity::prelude::*;
-use serenity::client::bridge::gateway::GatewayIntents;
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod commands;
 mod database;
@@ -15,10 +15,10 @@ mod link_security;
 
 use commands::{handle_ping, handle_clear, handle_whitelist};
 use link_security::{LinkSecurityEngine, handle_message};
-use serenity::prelude::TypeMapKey;
 
 struct Handler {
     security_engine: LinkSecurityEngine,
+    commands_registered: AtomicBool,
 }
 
 // كمفتاح لتخزين قاعدة البيانات في TypeMap
@@ -38,12 +38,12 @@ impl EventHandler for Handler {
 
     // ===== معالج الأوامر =====
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
-            let user_id = command.user.id.0;
-            
+        if let Interaction::Command(command) = interaction {
+            let user_id = command.user.id.get();
+
             // الحصول على قاعدة البيانات
             let pool = ctx.data.read().await.get::<DatabaseKey>().cloned();
-            
+
             // التحقق من حالة الحظر
             let is_banned = if let Some(pool) = &pool {
                 database::is_user_banned(&**pool, user_id)
@@ -54,37 +54,26 @@ impl EventHandler for Handler {
             };
 
             if is_banned {
-                let _ = command
-                    .create_interaction_response(&ctx.http, |response| {
-                        response
-                            .kind(InteractionResponseType::ChannelMessageWithSource)
-                            .interaction_response_data(|message| {
-                                message.content("❌ أنت محظور من استخدام هذا البوت")
-                            })
-                    })
-                    .await;
+                let _ = command.create_response(&ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("❌ أنت محظور من استخدام هذا البوت")
+                    )
+                ).await;
                 return;
             }
 
             // تنفيذ الأمر
             match command.data.name.as_str() {
-                "ping" => {
-                    handle_ping(&ctx, &command).await;
-                }
-                "clear" => {
-                    handle_clear(&ctx, &command).await;
-                }
-                "whitelist" => {
-                    handle_whitelist(&ctx, &command).await;
-                }
+                "ping"      => handle_ping(&ctx, &command).await,
+                "clear"     => handle_clear(&ctx, &command).await,
+                "whitelist" => handle_whitelist(&ctx, &command).await,
                 _ => {
-                    let _ = command
-                        .create_interaction_response(&ctx.http, |response| {
-                            response
-                                .kind(InteractionResponseType::ChannelMessageWithSource)
-                                .interaction_response_data(|message| message.content("Unknown command"))
-                        })
-                        .await;
+                    let _ = command.create_response(&ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new().content("Unknown command")
+                        )
+                    ).await;
                 }
             }
 
@@ -99,77 +88,63 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
         println!("🛡️ Link Security System: ACTIVE");
-        
-        // تسجيل أمر /ping
-        if let Err(why) = serenity::model::interactions::application_command::ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("ping")
-                .description("استجابة البيينج مع قياس السرعة")
-        })
-        .await
-        {
-            println!("Error registering ping command: {:?}", why);
-        } else {
-            println!("✅ Ping command registered!");
+
+        // تسجيل الأوامر مرة واحدة فقط حتى عند إعادة الاتصال
+        if self.commands_registered.swap(true, Ordering::SeqCst) {
+            println!("⏭️ Commands already registered, skipping.");
+            return;
         }
-        
-        // تسجيل أمر /clear
-        if let Err(why) = serenity::model::interactions::application_command::ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("clear")
+
+        // إذا وُجد GUILD_ID → guild commands (تنتشر فورياً، مثالي للتطوير)
+        // إذا لم يوجد → global commands (تحتاج حتى ساعة للانتشار، للإنتاج)
+        let guild_id = env::var("GUILD_ID")
+            .ok()
+            .and_then(|id| id.parse::<u64>().ok())
+            .map(GuildId::new);
+
+        let commands = vec![
+            CreateCommand::new("ping")
+                .description("استجابة البيينج مع قياس السرعة"),
+            CreateCommand::new("clear")
                 .description("حذف الرسائل من القناة")
-                .create_option(|option| {
-                    option
-                        .name("amount")
-                        .description("عدد الرسائل المراد حذفها (1-100)")
-                        .kind(serenity::model::interactions::application_command::ApplicationCommandOptionType::Integer)
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::Integer, "amount", "عدد الرسائل المراد حذفها (1-100)")
                         .min_int_value(1)
                         .max_int_value(100)
                         .required(false)
-                })
-        })
-        .await
-        {
-            println!("Error registering clear command: {:?}", why);
-        } else {
-            println!("✅ Clear command registered!");
-        }
-
-        // تسجيل أمر /whitelist
-        if let Err(why) = serenity::model::interactions::application_command::ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("whitelist")
+                ),
+            CreateCommand::new("whitelist")
                 .description("إدارة القائمة البيضاء للروابط")
-                .create_option(|opt| {
-                    opt.name("add")
-                        .description("إضافة رابط أو domain للقائمة البيضاء")
-                        .kind(serenity::model::interactions::application_command::ApplicationCommandOptionType::SubCommand)
-                        .create_sub_option(|s| {
-                            s.name("domain")
-                                .description("الرابط أو الـ domain مثال: youtube.com")
-                                .kind(serenity::model::interactions::application_command::ApplicationCommandOptionType::String)
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "add", "إضافة رابط أو domain للقائمة البيضاء")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "domain", "الرابط أو الـ domain مثال: youtube.com")
                                 .required(true)
-                        })
-                })
-                .create_option(|opt| {
-                    opt.name("remove")
-                        .description("حذف domain من القائمة البيضاء")
-                        .kind(serenity::model::interactions::application_command::ApplicationCommandOptionType::SubCommand)
-                        .create_sub_option(|s| {
-                            s.name("domain")
-                                .description("الـ domain المراد حذفه")
-                                .kind(serenity::model::interactions::application_command::ApplicationCommandOptionType::String)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "remove", "حذف domain من القائمة البيضاء")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "domain", "الـ domain المراد حذفه")
                                 .required(true)
-                        })
-                })
-        })
-        .await
-        {
-            println!("Error registering whitelist command: {:?}", why);
-        } else {
-            println!("✅ Whitelist command registered!");
-        }
+                        )
+                ),
+        ];
 
+        match guild_id {
+            Some(gid) => {
+                match gid.set_commands(&ctx.http, commands).await {
+                    Ok(cmds) => println!("✅ {} أوامر مسجّلة على السيرفر (فورياً)", cmds.len()),
+                    Err(e)   => println!("❌ خطأ في تسجيل أوامر السيرفر: {:?}", e),
+                }
+            }
+            None => {
+                match Command::set_global_commands(&ctx.http, commands).await {
+                    Ok(cmds) => println!("✅ {} أوامر مسجّلة عالمياً (قد تحتاج حتى ساعة)", cmds.len()),
+                    Err(e)   => println!("❌ خطأ في تسجيل الأوامر العالمية: {:?}", e),
+                }
+            }
+        }
     }
 }
 
@@ -180,11 +155,6 @@ async fn main() {
     
     let token = env::var("DISCORD_TOKEN")
         .expect("Expected a token in the environment");
-
-    let application_id: u64 = env::var("APPLICATION_ID")
-        .expect("Expected APPLICATION_ID in the environment")
-        .parse()
-        .expect("APPLICATION_ID should be a valid u64");
 
     let database_url = env::var("DATABASE_URL")
         .expect("Expected DATABASE_URL in the environment");
@@ -208,17 +178,19 @@ async fn main() {
     // إنشاء محرك الحماية
     let security_engine = link_security::create_engine(google_api_key, virustotal_api_key, Arc::clone(&pool));
 
+    // نسخة للـ graceful shutdown بعد توقف الـ client
+    let pool_for_shutdown = Arc::clone(&pool);
+
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::GUILDS
-        | GatewayIntents::from_bits_truncate(1 << 15); // MESSAGE_CONTENT (privileged)
+        | GatewayIntents::MESSAGE_CONTENT;
 
-    let mut client = Client::builder(&token)
+    let mut client = Client::builder(&token, intents)
         .event_handler(Handler {
             security_engine,
+            commands_registered: AtomicBool::new(false),
         })
-        .application_id(application_id)
-        .intents(intents)
         .await
         .expect("Error creating client");
 
@@ -231,4 +203,9 @@ async fn main() {
     if let Err(why) = client.start().await {
         eprintln!("Client error: {:?}", why);
     }
+
+    // Graceful shutdown: إغلاق اتصالات قاعدة البيانات بأمان
+    println!("🔌 Closing database connections...");
+    pool_for_shutdown.close().await;
+    println!("✅ Database connections closed.");
 }

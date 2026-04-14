@@ -1,5 +1,6 @@
 use sqlx::mysql::MySqlPool;
 use sqlx::Row;
+use sha2::{Sha256, Digest};
 
 /// تهيئة قاعدة البيانات والجداول
 pub async fn init_database(database_url: &str) -> Result<MySqlPool, sqlx::Error> {
@@ -7,6 +8,17 @@ pub async fn init_database(database_url: &str) -> Result<MySqlPool, sqlx::Error>
     if let Some(slash_pos) = database_url.rfind('/') {
         let base_url = &database_url[..slash_pos];
         let db_name = &database_url[slash_pos + 1..];
+
+        // تعقيم اسم قاعدة البيانات: فقط أحرف، أرقام، وشرطة سفلية
+        let is_valid = !db_name.is_empty()
+            && db_name.len() <= 64
+            && db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        if !is_valid {
+            return Err(sqlx::Error::Configuration(
+                format!("اسم قاعدة البيانات غير صالح: '{}'", db_name).into()
+            ));
+        }
 
         // الاتصال بـ MySQL بدون تحديد قاعدة بيانات
         if let Ok(base_pool) = MySqlPool::connect(base_url).await {
@@ -96,7 +108,7 @@ async fn create_tables(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS url_cache (
-            url_hash CHAR(32) PRIMARY KEY,
+            url_hash CHAR(64) PRIMARY KEY,
             url VARCHAR(2048) NOT NULL,
             is_safe BOOLEAN NOT NULL,
             risk_score FLOAT NOT NULL,
@@ -122,6 +134,13 @@ async fn create_tables(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    // ترقية عمود url_hash من CHAR(32) إلى CHAR(64) إن كان قديماً
+    let _ = sqlx::query(
+        "ALTER TABLE url_cache MODIFY COLUMN url_hash CHAR(64) NOT NULL"
+    )
+    .execute(pool)
+    .await;
 
     println!("✅ قاعدة البيانات والجداول تم إنشاؤها بنجاح!");
     Ok(())
@@ -350,7 +369,7 @@ pub struct CachedUrl {
 
 /// البحث عن رابط في الكاش
 pub async fn db_get_url(pool: &MySqlPool, url: &str) -> Option<CachedUrl> {
-    let hash = format!("{:x}", md5::compute(url));
+    let hash = format!("{:x}", Sha256::digest(url.as_bytes()));
     let row = sqlx::query(
         "SELECT is_safe, risk_score, classification, reason FROM url_cache \
          WHERE url_hash = ? AND expires_at > NOW()"
@@ -378,7 +397,7 @@ pub async fn db_save_url(
     reason: &str,
     ttl_hours: i64,
 ) -> Result<(), sqlx::Error> {
-    let hash = format!("{:x}", md5::compute(url));
+    let hash = format!("{:x}", Sha256::digest(url.as_bytes()));
     sqlx::query(
         "INSERT INTO url_cache (url_hash, url, is_safe, risk_score, classification, reason, expires_at) \
          VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR)) \

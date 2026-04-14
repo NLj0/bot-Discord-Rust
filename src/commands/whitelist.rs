@@ -1,7 +1,6 @@
 use serenity::client::Context;
-use serenity::model::prelude::application_command::ApplicationCommandInteraction;
-use serenity::model::interactions::InteractionResponseType;
-use serenity::model::interactions::InteractionApplicationCommandCallbackDataFlags;
+use serenity::model::application::{CommandInteraction, CommandDataOptionValue};
+use serenity::builder::{CreateInteractionResponse, CreateInteractionResponseMessage};
 use crate::database::{add_to_whitelist, remove_from_whitelist};
 use crate::DatabaseKey;
 
@@ -18,7 +17,7 @@ fn extract_domain(url_or_domain: &str) -> String {
         .to_lowercase()
 }
 
-pub async fn handle_whitelist(ctx: &Context, command: &ApplicationCommandInteraction) {
+pub async fn handle_whitelist(ctx: &Context, command: &CommandInteraction) {
     // التحقق من الصلاحيات (يجب أن يكون Admin)
     let has_perm = command
         .member
@@ -28,15 +27,13 @@ pub async fn handle_whitelist(ctx: &Context, command: &ApplicationCommandInterac
         .unwrap_or(false);
 
     if !has_perm {
-        let _ = command
-            .create_interaction_response(&ctx.http, |r| {
-                r.kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|m| {
-                        m.content("❌ هذا الأمر للـ Admins فقط")
-                            .flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
-                    })
-            })
-            .await;
+        let _ = command.create_response(&ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("❌ هذا الأمر للـ Admins فقط")
+                    .ephemeral(true)
+            )
+        ).await;
         return;
     }
 
@@ -45,24 +42,30 @@ pub async fn handle_whitelist(ctx: &Context, command: &ApplicationCommandInterac
         None => return,
     };
 
-    let input = subcommand
-        .options
+    let (sub_name, sub_opts) = match &subcommand.value {
+        CommandDataOptionValue::SubCommand(opts) => (subcommand.name.as_str(), opts),
+        _ => return,
+    };
+
+    let input = sub_opts
         .first()
-        .and_then(|o| o.value.as_ref())
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|o| {
+            if let CommandDataOptionValue::String(s) = &o.value {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
 
     if input.is_empty() {
-        let _ = command
-            .create_interaction_response(&ctx.http, |r| {
-                r.kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|m| {
-                        m.content("❌ الرجاء إدخال رابط أو domain")
-                            .flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
-                    })
-            })
-            .await;
+        let _ = command.create_response(&ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("❌ الرجاء إدخال رابط أو domain")
+                    .ephemeral(true)
+            )
+        ).await;
         return;
     }
 
@@ -71,18 +74,17 @@ pub async fn handle_whitelist(ctx: &Context, command: &ApplicationCommandInterac
     let pool = match ctx.data.read().await.get::<DatabaseKey>().cloned() {
         Some(p) => p,
         None => {
-            let _ = command
-                .create_interaction_response(&ctx.http, |r| {
-                    r.kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|m| m.content("❌ خطأ في الداتا بيس"))
-                })
-                .await;
+            let _ = command.create_response(&ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content("❌ خطأ في الداتا بيس")
+                )
+            ).await;
             return;
         }
     };
 
-    let user_id = command.user.id.0;
-    let msg = match subcommand.name.as_str() {
+    let user_id = command.user.id.get();
+    let msg = match sub_name {
         "add" => match add_to_whitelist(&*pool, &domain, user_id).await {
             Ok(true)  => format!("✅ تم إضافة `{}` للقائمة البيضاء", domain),
             Ok(false) => format!("ℹ️ `{}` موجود مسبقاً في القائمة البيضاء", domain),
@@ -95,13 +97,11 @@ pub async fn handle_whitelist(ctx: &Context, command: &ApplicationCommandInterac
         _ => "❌ subcommand غير معروف".to_string(),
     };
 
-    let _ = command
-        .create_interaction_response(&ctx.http, |r| {
-            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|m| {
-                    m.content(msg)
-                        .flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
-                })
-        })
-        .await;
+    let _ = command.create_response(&ctx.http,
+        CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(msg)
+                .ephemeral(true)
+        )
+    ).await;
 }
