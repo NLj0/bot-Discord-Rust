@@ -1,9 +1,21 @@
 use sqlx::mysql::MySqlPool;
 use sqlx::Row;
-use chrono::{DateTime, Utc};
 
 /// تهيئة قاعدة البيانات والجداول
 pub async fn init_database(database_url: &str) -> Result<MySqlPool, sqlx::Error> {
+    // استخراج اسم قاعدة البيانات من الـ URL وإنشاؤها إن لم تكن موجودة
+    if let Some(slash_pos) = database_url.rfind('/') {
+        let base_url = &database_url[..slash_pos];
+        let db_name = &database_url[slash_pos + 1..];
+
+        // الاتصال بـ MySQL بدون تحديد قاعدة بيانات
+        if let Ok(base_pool) = MySqlPool::connect(base_url).await {
+            let create_sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", db_name);
+            let _ = sqlx::query(&create_sql).execute(&base_pool).await;
+            base_pool.close().await;
+        }
+    }
+
     let pool = MySqlPool::connect(database_url).await?;
     
     // إنشء جداول قاعدة البيانات
@@ -80,11 +92,83 @@ async fn create_tables(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // جدول كاش الروابط
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS url_cache (
+            url_hash CHAR(32) PRIMARY KEY,
+            url VARCHAR(2048) NOT NULL,
+            is_safe BOOLEAN NOT NULL,
+            risk_score FLOAT NOT NULL,
+            classification VARCHAR(50) NOT NULL,
+            reason VARCHAR(500) NOT NULL,
+            checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL
+        )
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    // جدول القائمة البيضاء
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS whitelist (
+            domain VARCHAR(255) PRIMARY KEY,
+            added_by BIGINT NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        "#
+    )
+    .execute(pool)
+    .await?;
+
     println!("✅ قاعدة البيانات والجداول تم إنشاؤها بنجاح!");
     Ok(())
 }
 
+/// التحقق إذا domain في الـ whitelist
+pub async fn is_whitelisted(pool: &MySqlPool, domain: &str) -> bool {
+    sqlx::query("SELECT 1 FROM whitelist WHERE domain = ?")
+        .bind(domain)
+        .fetch_optional(pool)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false)
+}
+
+/// إضافة domain للـ whitelist
+pub async fn add_to_whitelist(
+    pool: &MySqlPool,
+    domain: &str,
+    added_by: u64,
+) -> Result<bool, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT IGNORE INTO whitelist (domain, added_by) VALUES (?, ?)"
+    )
+    .bind(domain)
+    .bind(added_by as i64)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// حذف domain من الـ whitelist
+#[allow(dead_code)]
+pub async fn remove_from_whitelist(
+    pool: &MySqlPool,
+    domain: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM whitelist WHERE domain = ?")
+        .bind(domain)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// إضافة مستخدم جديد
+#[allow(dead_code)]
 pub async fn add_user(
     pool: &MySqlPool,
     user_id: u64,
@@ -128,6 +212,7 @@ pub async fn log_command(
 }
 
 /// الحصول على إحصائيات مستخدم
+#[allow(dead_code)]
 pub async fn get_user_stats(
     pool: &MySqlPool,
     user_id: u64,
@@ -149,6 +234,7 @@ pub async fn get_user_stats(
 }
 
 /// إضافة تحذير للمستخدم
+#[allow(dead_code)]
 pub async fn add_warning(
     pool: &MySqlPool,
     user_id: u64,
@@ -177,6 +263,7 @@ pub async fn add_warning(
 }
 
 /// حظر مستخدم
+#[allow(dead_code)]
 pub async fn ban_user(
     pool: &MySqlPool,
     user_id: u64,
@@ -220,6 +307,7 @@ pub async fn is_user_banned(
 }
 
 /// الحصول على أعلى المستخدمين نشاطاً
+#[allow(dead_code)]
 pub async fn get_top_users(
     pool: &MySqlPool,
     limit: i64,
@@ -242,10 +330,71 @@ pub async fn get_top_users(
 
 /// هيكل بيانات إحصائيات المستخدم
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct UserStats {
     pub user_id: u64,
     pub username: String,
     pub total_commands: i32,
     pub warnings: i32,
     pub is_banned: bool,
+}
+
+/// هيكل نتيجة الرابط المخزّن في الداتا بيس
+#[derive(Debug, Clone)]
+pub struct CachedUrl {
+    pub is_safe: bool,
+    pub risk_score: f32,
+    pub classification: String,
+    pub reason: String,
+}
+
+/// البحث عن رابط في الكاش
+pub async fn db_get_url(pool: &MySqlPool, url: &str) -> Option<CachedUrl> {
+    let hash = format!("{:x}", md5::compute(url));
+    let row = sqlx::query(
+        "SELECT is_safe, risk_score, classification, reason FROM url_cache \
+         WHERE url_hash = ? AND expires_at > NOW()"
+    )
+    .bind(&hash)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+
+    row.map(|r| CachedUrl {
+        is_safe:        r.get("is_safe"),
+        risk_score:     r.get::<f32, _>("risk_score"),
+        classification: r.get("classification"),
+        reason:         r.get("reason"),
+    })
+}
+
+/// حفظ نتيجة رابط في الكاش (TTL بالساعات)
+pub async fn db_save_url(
+    pool: &MySqlPool,
+    url: &str,
+    is_safe: bool,
+    risk_score: f32,
+    classification: &str,
+    reason: &str,
+    ttl_hours: i64,
+) -> Result<(), sqlx::Error> {
+    let hash = format!("{:x}", md5::compute(url));
+    sqlx::query(
+        "INSERT INTO url_cache (url_hash, url, is_safe, risk_score, classification, reason, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR)) \
+         ON DUPLICATE KEY UPDATE \
+         is_safe=VALUES(is_safe), risk_score=VALUES(risk_score), \
+         classification=VALUES(classification), reason=VALUES(reason), \
+         checked_at=NOW(), expires_at=VALUES(expires_at)"
+    )
+    .bind(&hash)
+    .bind(url)
+    .bind(is_safe)
+    .bind(risk_score)
+    .bind(classification)
+    .bind(reason)
+    .bind(ttl_hours)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

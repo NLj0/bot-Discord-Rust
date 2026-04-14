@@ -58,7 +58,7 @@ CREATE DATABASE discord_bot_shield_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unic
 Host: 127.0.0.1 (أو localhost)
 Port: 3306 (الافتراضي)
 Username: root
-Password: Ad100200300
+Password: <your-password>
 Database: discord_bot_shield_db
 ```
 
@@ -66,18 +66,20 @@ Database: discord_bot_shield_db
 
 #### أنشئ ملف `.env` في جذر المشروع
 ```bash
-# Discord Bot Token
+# Discord Bot Token (من Discord Developer Portal)
 DISCORD_TOKEN=<your-bot-token>
 
 # Application ID (من Discord Developer Portal)
 APPLICATION_ID=<your-application-id>
 
 # Database Configuration (MariaDB)
-DATABASE_URL=mysql://root:Ad100200300@127.0.0.1:3306/discord_bot_shield_db
+DATABASE_URL=mysql://root:<your-password>@127.0.0.1:3306/discord_bot_shield_db
 
 # Logging
 RUST_LOG=debug
 ```
+
+⚠️ **تحذير أمان**: لا تشارك هذه الملفات العامة مع أحد!
 
 ### 5️⃣ تثبيت المتطلبات وبناء المشروع
 ```bash
