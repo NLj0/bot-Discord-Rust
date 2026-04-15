@@ -67,7 +67,7 @@ pub async fn handle_clear(ctx: &Context, command: &CommandInteraction) {
         }
         Ok(m) => m,
         Err(why) => {
-            let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(format!("❌ خطأ في جلب الرسائل: {}", why))).await;
+            let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(format!("❌ Failed to fetch messages: {}", why))).await;
             return;
         }
     };
@@ -78,7 +78,7 @@ pub async fn handle_clear(ctx: &Context, command: &CommandInteraction) {
         let bot_id = match ctx.http.get_current_user().await {
             Ok(user) => user.id,
             Err(_) => {
-                let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content("❌ خطأ في الحصول على معلومات البوت")).await;
+                let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content("❌ Failed to get bot information")).await;
                 return;
             }
         };
@@ -117,7 +117,7 @@ pub async fn handle_clear(ctx: &Context, command: &CommandInteraction) {
                 let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(format!("✅ تم حذف `{}` رسالة بنجاح!", deletable.len()))).await;
             }
             Err(why) => {
-                let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(format!("❌ خطأ في الحذف: {}", why))).await;
+                let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(format!("❌ Failed to delete messages: {}", why))).await;
             }
         }
     }

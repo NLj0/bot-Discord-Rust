@@ -13,7 +13,7 @@ mod commands;
 mod database;
 mod link_security;
 
-use commands::{handle_ping, handle_clear, handle_whitelist};
+use commands::{handle_ping, handle_clear, handle_whitelist, handle_blacklist_server, handle_warn, handle_ban};
 use link_security::{LinkSecurityEngine, handle_message};
 
 struct Handler {
@@ -65,9 +65,12 @@ impl EventHandler for Handler {
 
             // تنفيذ الأمر
             match command.data.name.as_str() {
-                "ping"      => handle_ping(&ctx, &command).await,
-                "clear"     => handle_clear(&ctx, &command).await,
-                "whitelist" => handle_whitelist(&ctx, &command).await,
+                "ping"             => handle_ping(&ctx, &command).await,
+                "clear"            => handle_clear(&ctx, &command).await,
+                "whitelist"        => handle_whitelist(&ctx, &command).await,
+                "blacklist-server" => handle_blacklist_server(&ctx, &command).await,
+                "warn"             => handle_warn(&ctx, &command).await,
+                "ban"              => handle_ban(&ctx, &command).await,
                 _ => {
                     let _ = command.create_response(&ctx.http,
                         CreateInteractionResponse::Message(
@@ -79,7 +82,8 @@ impl EventHandler for Handler {
 
             // تسجيل استخدام الأمر
             if let Some(pool) = pool {
-                let _ = database::log_command(&*pool, user_id, &command.data.name).await;
+                let guild_id = command.guild_id.map(|g| g.get()).unwrap_or(0);
+                let _ = database::log_command(&*pool, user_id, guild_id, &command.data.name).await;
             }
         }
     }
@@ -129,19 +133,107 @@ impl EventHandler for Handler {
                                 .required(true)
                         )
                 ),
+            CreateCommand::new("blacklist-server")
+                .description("Manage server blacklist")
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "add", "Add a server to the blacklist")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "guild_id", "Server ID (snowflake)")
+                                .required(true)
+                        )
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "reason", "Reason for blacklisting")
+                                .required(false)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "remove", "Remove a server from the blacklist")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "guild_id", "Server ID to remove")
+                                .required(true)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "list", "List all blacklisted servers")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::Integer, "page", "Page number")
+                                .min_int_value(1)
+                                .required(false)
+                        )
+                ),
+            CreateCommand::new("warn")
+                .description("Manage user warnings")
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "add", "Warn a user")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::User, "user", "User to warn")
+                                .required(true)
+                        )
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "reason", "Reason for warning")
+                                .required(false)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "remove", "Remove latest warning from a user")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::User, "user", "User to unwarn")
+                                .required(true)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "list", "List warnings")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::User, "user", "Filter by user (optional)")
+                                .required(false)
+                        )
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::Integer, "page", "Page number")
+                                .min_int_value(1)
+                                .required(false)
+                        )
+                ),
+            CreateCommand::new("ban")
+                .description("Manage bot bans")
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "add", "Ban a user from using the bot")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::User, "user", "User to ban")
+                                .required(true)
+                        )
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "reason", "Reason for ban")
+                                .required(false)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "remove", "Unban a user")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::User, "user", "User to unban")
+                                .required(true)
+                        )
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "list", "List banned users")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::Integer, "page", "Page number")
+                                .min_int_value(1)
+                                .required(false)
+                        )
+                ),
         ];
 
         match guild_id {
             Some(gid) => {
                 match gid.set_commands(&ctx.http, commands).await {
-                    Ok(cmds) => println!("✅ {} أوامر مسجّلة على السيرفر (فورياً)", cmds.len()),
-                    Err(e)   => println!("❌ خطأ في تسجيل أوامر السيرفر: {:?}", e),
+                    Ok(cmds) => println!("✅ {} commands registered on the server (instant)", cmds.len()),
+                    Err(e)   => println!("❌ Failed to register server commands: {:?}", e),
                 }
             }
             None => {
                 match Command::set_global_commands(&ctx.http, commands).await {
-                    Ok(cmds) => println!("✅ {} أوامر مسجّلة عالمياً (قد تحتاج حتى ساعة)", cmds.len()),
-                    Err(e)   => println!("❌ خطأ في تسجيل الأوامر العالمية: {:?}", e),
+                    Ok(cmds) => println!("✅ {} commands registered globally (may take up to 1 hour)", cmds.len()),
+                    Err(e)   => println!("❌ Failed to register global commands: {:?}", e),
                 }
             }
         }
@@ -166,11 +258,11 @@ async fn main() {
     // تهيئة قاعدة البيانات
     let pool = match database::init_database(&database_url).await {
         Ok(pool) => {
-            println!("✅ تم الاتصال بقاعدة البيانات بنجاح!");
+            println!("✅ Connected to database successfully!");
             Arc::new(pool)
         }
         Err(e) => {
-            eprintln!("❌ خطأ في الاتصال بقاعدة البيانات: {}", e);
+            eprintln!("❌ Failed to connect to database: {}", e);
             return;
         }
     };

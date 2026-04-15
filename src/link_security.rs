@@ -229,7 +229,7 @@ impl RiskScorer {
             if domain_name == *target { continue; }
             let dist = Self::levenshtein(domain_name, target);
             if dist >= 1 && dist <= 2 {
-                println!("[TYPOSQUAT] '{}' يشبه '{}' (فرق={} حرف)", domain_name, target, dist);
+                println!("[TYPOSQUAT] '{}' resembles '{}' (distance={} char)", domain_name, target, dist);
                 return true;
             }
         }
@@ -244,26 +244,96 @@ impl RiskScorer {
 pub struct SecurityList;
 
 impl SecurityList {
-    /// معروف أنه خطر؟
+    /// Is this URL known to be dangerous?
     pub fn is_blacklisted(url: &str) -> bool {
-        let blacklist = vec![
-            "phishing",
-            "malware",
-            "scam",
+        let lower = url.to_lowercase();
+        let domain = RiskScorer::extract_domain(&lower);
+        let tld = domain.split('.').last().unwrap_or("");
+
+        // 1. Explicit malicious keywords in URL (path or domain)
+        const MALICIOUS_KEYWORDS: &[&str] = &[
+            "phishing", "malware", "scam", "hack", "crack",
+            "free-nitro", "freenitro", "discord-gift", "discordgift",
+            "free-robux", "freerobux", "freevbucks", "vbucks-free",
+            "login-verify", "verify-login", "account-suspended",
+            "confirm-identity", "suspended-account", "wallet-connect",
+            "claim-prize", "you-won", "verify-human",
         ];
-        blacklist.iter().any(|b| url.to_lowercase().contains(b))
+        if MALICIOUS_KEYWORDS.iter().any(|k| lower.contains(k)) {
+            return true;
+        }
+
+        // 2. Known IP-logger / grabify services
+        const IP_LOGGERS: &[&str] = &[
+            "grabify.link", "iplogger.org", "iplogger.com", "iplogger.ru",
+            "2no.co", "yip.su", "bmwforum.co", "leancoding.co",
+            "youripleak.com", "blasze.tk", "ps3cfw.com", "api.grabify",
+            "ezstat.ru", "lovelocator.net", "geolocation.live", "ssregistry.com",
+        ];
+        if IP_LOGGERS.iter().any(|b| domain.contains(b)) {
+            return true;
+        }
+
+        // 3. Discord / gaming scam domain patterns
+        const SCAM_PATTERNS: &[&str] = &[
+            "discord-nitro", "discordnitro", "discord-free",
+            "steam-community", "steamcommunity-", "steam-gift", "steamgift",
+            "roblox-free", "robux-free", "free-robux",
+            "csgo-", "cs-go-", "free-skin", "freeskin",
+            "epicgames-free", "free-epic",
+        ];
+        if SCAM_PATTERNS.iter().any(|p| domain.contains(p)) {
+            return true;
+        }
+
+        // 4. Suspicious free TLDs + additional signal (long or hyphenated domain)
+        const SUSPICIOUS_TLDS: &[&str] = &["tk", "ml", "ga", "cf", "gq", "pw", "click", "link"];
+        let suspicious_tld = SUSPICIOUS_TLDS.contains(&tld);
+        let hyphen_count = domain.chars().filter(|&c| c == '-').count();
+        let domain_len = domain.len();
+        if suspicious_tld && (hyphen_count >= 2 || domain_len > 25) {
+            return true;
+        }
+
+        // 5. Excessive subdomain depth (4+ dots = likely DGA or phishing host)
+        if domain.chars().filter(|&c| c == '.').count() >= 4 {
+            return true;
+        }
+
+        // 6. Long subdomain on free hosting platforms (common phishing vector)
+        const FREE_HOSTS: &[&str] = &[
+            "000webhostapp.com", "weebly.com", "wixsite.com",
+            "netlify.app", "vercel.app", "pages.dev",
+            "glitch.me", "repl.co", "web.app",
+        ];
+        if FREE_HOSTS.iter().any(|h| domain.ends_with(h)) && domain_len > 30 {
+            return true;
+        }
+
+        false
     }
 
-    /// معروف أنه آمن؟
+    /// Is this URL known to be safe?
     pub fn is_whitelisted(url: &str) -> bool {
-        let whitelist = vec![
+        let domain = RiskScorer::extract_domain(url);
+        const WHITELIST: &[&str] = &[
             "github.com",
             "rust-lang.org",
             "google.com",
             "stackoverflow.com",
             "discord.com",
+            "youtube.com",
+            "twitch.tv",
+            "reddit.com",
+            "wikipedia.org",
+            "mozilla.org",
+            "microsoft.com",
+            "npmjs.com",
+            "crates.io",
+            "docs.rs",
         ];
-        whitelist.iter().any(|w| url.to_lowercase().contains(w))
+        // Match exact domain or any subdomain (e.g. docs.github.com)
+        WHITELIST.iter().any(|w| domain == *w || domain.ends_with(&format!(".{}", w)))
     }
 }
 
@@ -433,7 +503,7 @@ impl VirusTotal {
             .form(&params)
             .send()
             .await?;
-        println!("[VIRUSTOTAL] تم إرسال الرابط للتحليل: {}", url);
+        println!("[VIRUSTOTAL] Submitted for analysis: {}", url);
         Ok(())
     }
 }
@@ -473,13 +543,13 @@ impl LinkSecurityEngine {
         if let Some(ref pool) = self.pool {
             let domain = RiskScorer::extract_domain(url);
             if is_whitelisted(pool, &domain).await {
-                println!("[WHITELIST:DB] ✅ {}", domain);
+                println!("[WHITELIST:DB] ✅ whitelisted: {}", domain);
                 let result = LinkCheckResult {
                     url: url.to_string(),
                     level: SecurityLevel::Whitelist,
                     risk_score: 0.0,
                     is_safe: true,
-                    reason: format!("في القائمة البيضاء: {}", domain),
+                    reason: format!("Whitelisted: {}", domain),
                 };
                 LinkCache::set(url, result.clone(), self.cache_ttl);
                 return result;
@@ -521,7 +591,7 @@ impl LinkSecurityEngine {
                 level: SecurityLevel::Blacklist,
                 risk_score: 1.0,
                 is_safe: false,
-                reason: "معروف في قائمة الحظر".to_string(),
+                reason: "Known blacklisted URL".to_string(),
             };
             LinkCache::set(url, result.clone(), self.cache_ttl);
             return result;
@@ -534,7 +604,7 @@ impl LinkSecurityEngine {
                 level: SecurityLevel::Whitelist,
                 risk_score: 0.1,
                 is_safe: true,
-                reason: "في قائمة الثقة".to_string(),
+                reason: "In trusted whitelist".to_string(),
             };
             LinkCache::set(url, result.clone(), self.cache_ttl);
             return result;
@@ -545,15 +615,21 @@ impl LinkSecurityEngine {
 
         // Level 1: Google Safe Browsing
         if let Some(ref google) = self.google {
+            let gsb_start = Instant::now();
             match google.check(url).await {
                 Ok(is_safe) => {
+                    println!("[GOOGLE] ⏱️ {}ms | {} | {}",
+                        gsb_start.elapsed().as_millis(),
+                        url,
+                        if is_safe { "✅ Safe" } else { "🚨 THREAT DETECTED" }
+                    );
                     if !is_safe {
                         let result = LinkCheckResult {
                             url: url.to_string(),
                             level: SecurityLevel::Blacklist,
                             risk_score: 0.95,
                             is_safe: false,
-                            reason: "Google Safe Browsing: الرابط خطر".to_string(),
+                            reason: "Google Safe Browsing: threat detected".to_string(),
                         };
                         self.save(&result).await;
                         LinkCache::set(url, result.clone(), self.cache_ttl);
@@ -561,9 +637,15 @@ impl LinkSecurityEngine {
                     }
                 }
                 Err(e) => {
-                    println!("[GOOGLE] خطأ: {}", e);
+                    println!("[GOOGLE] ⏱️ {}ms | {} | ❌ Error: {}",
+                        gsb_start.elapsed().as_millis(),
+                        url,
+                        e
+                    );
                 }
             }
+        } else {
+            println!("[GOOGLE] ⚠️ Skipped (no API key) | {}", url);
         }
 
         // Level 2: VirusTotal — إذا وصلنا هنا فـ Google لم يحظر الرابط
@@ -574,7 +656,7 @@ impl LinkSecurityEngine {
                     println!("[VIRUSTOTAL] ⏱️ {}ms | {} | {}",
                         vt_start.elapsed().as_millis(),
                         url,
-                        if is_safe { "✅ آمن" } else { "🚨 خطر" }
+                        if is_safe { "✅ Safe" } else { "🚨 THREAT DETECTED" }
                     );
                     if !is_safe {
                         let result = LinkCheckResult {
@@ -582,7 +664,7 @@ impl LinkSecurityEngine {
                             level: SecurityLevel::Blacklist,
                             risk_score: 0.9,
                             is_safe: false,
-                            reason: "VirusTotal: الرابط خطر".to_string(),
+                            reason: "VirusTotal: threat detected".to_string(),
                         };
                         self.save(&result).await;
                         LinkCache::set(url, result.clone(), self.cache_ttl);
@@ -591,7 +673,7 @@ impl LinkSecurityEngine {
                     risk_score = (risk_score * 0.5).min(0.3);
                 }
                 Err(e) => {
-                    println!("[VIRUSTOTAL] {}", e);
+                    println!("[VIRUSTOTAL] ❌ Error: {}", e);
                     risk_score = (risk_score + 0.3).min(1.0);
                 }
             }
@@ -612,9 +694,9 @@ impl LinkSecurityEngine {
             risk_score,
             is_safe,
             reason: if is_safe {
-                "لم يتم اكتشاف تهديدات".to_string()
+                "No threats detected".to_string()
             } else {
-                format!("درجة الخطر: {:.0}%", risk_score * 100.0)
+                format!("Risk score: {:.0}%", risk_score * 100.0)
             },
         };
 
@@ -643,9 +725,9 @@ impl LinkSecurityEngine {
                 &result.reason,
                 ttl,
             ).await {
-                println!("[DB] خطأ في حفظ الرابط: {}", e);
+                println!("[DB] Failed to save URL: {}", e);
             } else {
-                println!("[DB] 💾 حُفظ: {} | {}", result.url, classification);
+                println!("[DB] 💾 Saved: {} | {}", result.url, classification);
             }
         }
     }
@@ -659,7 +741,6 @@ impl LinkSecurityEngine {
 
         // استخراج الروابط
         let urls = URLExtractor::extract_urls(&msg.content);
-        println!("[SCAN] content={:?} urls_found={:?}", msg.content, urls);
         if urls.is_empty() {
             return None;
         }
@@ -726,7 +807,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message, engine: &LinkSecurityE
     // Rate Limiting: تجاهل المستخدم إذا أرسل روابط بسرعة كبيرة
     let user_id = msg.author.id.get();
     if is_rate_limited(user_id) {
-        println!("[RATE LIMIT] تم تجاهل السكان لـ user_id={}", user_id);
+        println!("[RATE LIMIT] Skipped scan for user_id={}", user_id);
         return;
     }
 
@@ -735,8 +816,6 @@ pub async fn handle_message(ctx: &Context, msg: &Message, engine: &LinkSecurityE
     if SEEN_MESSAGES.insert(msg_id, Instant::now()).is_some() {
         return;
     }
-
-    println!("[MSG] from={} content={:?}", msg.author.name, msg.content);
 
     match engine.scan_message(msg).await {
         Some(Action::Delete) => {

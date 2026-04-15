@@ -76,7 +76,7 @@ pub async fn handle_whitelist(ctx: &Context, command: &CommandInteraction) {
         None => {
             let _ = command.create_response(&ctx.http,
                 CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content("❌ خطأ في الداتا بيس")
+                    CreateInteractionResponseMessage::new().content("❌ Database error")
                 )
             ).await;
             return;
@@ -84,8 +84,9 @@ pub async fn handle_whitelist(ctx: &Context, command: &CommandInteraction) {
     };
 
     let user_id = command.user.id.get();
+    let guild_id = command.guild_id.map(|g| g.get()).unwrap_or(0);
     let msg = match sub_name {
-        "add" => match add_to_whitelist(&*pool, &domain, user_id).await {
+        "add" => match add_to_whitelist(&*pool, &domain, user_id, guild_id).await {
             Ok(true)  => format!("✅ تم إضافة `{}` للقائمة البيضاء", domain),
             Ok(false) => format!("ℹ️ `{}` موجود مسبقاً في القائمة البيضاء", domain),
             Err(e)    => format!("❌ خطأ: {}", e),
