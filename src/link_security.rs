@@ -1,4 +1,4 @@
-/// 🛡️ Link Security System
+/// 🛡️ Link Security System — Deep HTTP Inspection Engine
 /// فحص تلقائي للروابط في جميع الرسائل بدون أوامر
 /// Auto checks all URLs in messages without commands
 
@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use reqwest::Client;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use url::Url;
 use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
 use dashmap::DashMap;
@@ -24,31 +24,35 @@ use crate::database::{db_get_url, db_save_url, is_whitelisted};
 // 📊 DATA STRUCTURES
 // ═══════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SecurityLevel {
-    /// Level 0: Blacklist - حظر فوري
-    Blacklist,
-    /// Level 1: Unknown - فحص Google
-    Unknown,
-    /// Level 2: Whitelist - معروف وآمن
-    Whitelist,
-    /// Level 3: Suspicious - فحص عميق VirusTotal
-    Suspicious,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    Safe,
+    Malicious { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkCheckResult {
     pub url: String,
-    pub level: SecurityLevel,
-    pub risk_score: f32,
-    pub is_safe: bool,
-    pub reason: String,
+    pub verdict: Verdict,
+    pub user_id: Option<u64>,
+    pub timestamp: i64,
+}
+
+impl LinkCheckResult {
+    pub fn is_safe(&self) -> bool {
+        matches!(self.verdict, Verdict::Safe)
+    }
+    pub fn reason(&self) -> &str {
+        match &self.verdict {
+            Verdict::Safe => "No threats detected",
+            Verdict::Malicious { reason } => reason.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Action {
     Allow,
-    Warn,
     Delete,
 }
 
@@ -125,33 +129,25 @@ impl LinkCache {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 📊 RISK SCORING
+// 🔧 DOMAIN / IP HELPERS
 // ═══════════════════════════════════════════════════════════════════════
 
 pub struct RiskScorer;
 
 impl RiskScorer {
-    /// حساب درجة الخطر (0.0 - 1.0)
-    pub fn calculate(url: &str) -> f32 {
-        let mut score: f32 = 0.0;
-
-        if Self::is_shortlink(url)           { score += 0.2; }
-        if Self::is_ip_based(url)            { score += 0.3; }
-        if Self::has_suspicious_protocol(url){ score += 0.25; }
-        if Self::is_typosquatting(url)       { score += 0.85; }
-
-        score.min(1.0)
+    pub fn extract_domain(url: &str) -> String {
+        url.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
     }
 
-    fn is_shortlink(url: &str) -> bool {
-        let shorteners = vec![
-            "bit.ly", "tinyurl.com", "ow.ly", "goo.gl", "is.gd", "buff.ly"
-        ];
-        shorteners.iter().any(|s| url.contains(s))
-    }
-
-    fn is_ip_based(url: &str) -> bool {
-        // استخراج الجزء بعد http(s)://
+    pub fn is_ip_based(url: &str) -> bool {
         let host = url
             .trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -173,66 +169,6 @@ impl RiskScorer {
             return true;
         }
 
-        false
-    }
-
-    fn has_suspicious_protocol(url: &str) -> bool {
-        url.starts_with("data:") || url.starts_with("javascript:")
-    }
-
-    pub fn extract_domain(url: &str) -> String {
-        url.trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .split('?')
-            .next()
-            .unwrap_or("")
-            .to_lowercase()
-    }
-
-    fn levenshtein(a: &str, b: &str) -> usize {
-        let a: Vec<char> = a.chars().collect();
-        let b: Vec<char> = b.chars().collect();
-        let (m, n) = (a.len(), b.len());
-        if m == 0 { return n; }
-        if n == 0 { return m; }
-        let mut dp = vec![vec![0usize; n + 1]; m + 1];
-        for i in 0..=m { dp[i][0] = i; }
-        for j in 0..=n { dp[0][j] = j; }
-        for i in 1..=m {
-            for j in 1..=n {
-                dp[i][j] = if a[i-1] == b[j-1] {
-                    dp[i-1][j-1]
-                } else {
-                    1 + dp[i-1][j].min(dp[i][j-1]).min(dp[i-1][j-1])
-                };
-            }
-        }
-        dp[m][n]
-    }
-
-    fn is_typosquatting(url: &str) -> bool {
-        let domain = Self::extract_domain(url);
-        let domain_name = domain.split('.').next().unwrap_or("");
-        if domain_name.is_empty() { return false; }
-
-        let known = [
-            "discord", "youtube", "google", "github",
-            "twitter", "facebook", "instagram", "twitch",
-            "reddit", "microsoft", "apple", "amazon",
-            "netflix", "steam", "roblox", "paypal", "binance",
-        ];
-
-        for target in &known {
-            if domain_name == *target { continue; }
-            let dist = Self::levenshtein(domain_name, target);
-            if dist >= 1 && dist <= 2 {
-                println!("[TYPOSQUAT] '{}' resembles '{}' (distance={} char)", domain_name, target, dist);
-                return true;
-            }
-        }
         false
     }
 }
@@ -338,173 +274,120 @@ impl SecurityList {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 🌐 GOOGLE SAFE BROWSING
+// 🔬 HTTP INSPECTOR — Deep HTTP Inspection Engine
 // ═══════════════════════════════════════════════════════════════════════
 
-pub struct GoogleSafeBrowsing {
-    api_key: String,
+const MAX_REDIRECTS: usize = 5;
+
+pub struct HttpInspector {
     client: Client,
 }
 
-#[derive(Debug, Serialize)]
-struct GoogleRequest {
-    client: GoogleClientInfo,
-    threat_info: GoogleThreatInfo,
-}
-
-#[derive(Debug, Serialize)]
-struct GoogleClientInfo {
-    client_id: String,
-    client_version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GoogleThreatInfo {
-    threat_types: Vec<String>,
-    platform_types: Vec<String>,
-    threat_entry_types: Vec<String>,
-    threat_entries: Vec<GoogleThreatEntry>,
-}
-
-#[derive(Debug, Serialize)]
-struct GoogleThreatEntry {
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GoogleResponse {
-    matches: Option<Vec<GoogleMatch>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GoogleMatch {
-    #[allow(dead_code)]
-    threat_type: String,
-}
-
-impl GoogleSafeBrowsing {
-    pub fn new(api_key: String) -> Self {
-        Self {
-            api_key,
-            client: Client::new(),
-        }
+impl HttpInspector {
+    pub fn new() -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(4))
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(true)
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_default();
+        Self { client }
     }
 
-    pub async fn check(&self, url: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let request = GoogleRequest {
-            client: GoogleClientInfo {
-                client_id: "discord-bot".to_string(),
-                client_version: "1.0".to_string(),
-            },
-            threat_info: GoogleThreatInfo {
-                threat_types: vec![
-                    "MALWARE".to_string(),
-                    "SOCIAL_ENGINEERING".to_string(),
-                ],
-                platform_types: vec!["ANY_PLATFORM".to_string()],
-                threat_entry_types: vec!["URL".to_string()],
-                threat_entries: vec![GoogleThreatEntry {
-                    url: url.to_string(),
-                }],
-            },
+    pub async fn inspect(&self, url: &str) -> Verdict {
+        self.inspect_with_hops(url, 0).await
+    }
+
+    async fn inspect_with_hops(&self, url: &str, hops: usize) -> Verdict {
+        // Step 1 — Protocol pre-check
+        let lower = url.to_lowercase();
+        if lower.starts_with("data:") || lower.starts_with("javascript:") {
+            return Verdict::Malicious { reason: "Suspicious protocol".to_string() };
+        }
+        if RiskScorer::is_ip_based(url) {
+            return Verdict::Malicious { reason: "IP-based URL".to_string() };
+        }
+
+        // Redirect depth guard
+        if hops > MAX_REDIRECTS {
+            return Verdict::Malicious { reason: "Too many redirects".to_string() };
+        }
+
+        // Step 2 — HTTP request (redirects handled manually)
+        let response = match self.client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Verdict::Malicious { reason: format!("Request failed: {}", e) };
+            }
         };
 
-        let response = self
-            .client
-            .post(&format!(
-                "https://safebrowsing.googleapis.com/v4/threatMatches:find?key={}",
-                self.api_key
-            ))
-            .json(&request)
-            .send()
-            .await?;
+        let status = response.status();
 
-        let body: GoogleResponse = response.json().await?;
-        Ok(body.matches.is_none())
-    }
-}
+        // Step 3 — Manual redirect handling
+        if status.is_redirection() {
+            if let Some(location) = response.headers().get(reqwest::header::LOCATION) {
+                if let Ok(location_str) = location.to_str() {
+                    // Resolve the Location value against the current URL
+                    let next_url = if let Ok(base) = Url::parse(url) {
+                        base.join(location_str)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| location_str.to_string())
+                    } else {
+                        location_str.to_string()
+                    };
 
-// ═══════════════════════════════════════════════════════════════════════
-// 🦠 VIRUSTOTAL
-// ═══════════════════════════════════════════════════════════════════════
+                    println!("[HTTP] ↪️ Redirect ({}) {} → {}", status.as_u16(), url, next_url);
 
-pub struct VirusTotal {
-    api_key: String,
-    client: Client,
-}
+                    // Blacklist-check the redirect target before following
+                    if SecurityList::is_blacklisted(&next_url) {
+                        return Verdict::Malicious { reason: format!("Redirects to blacklisted URL: {}", next_url) };
+                    }
 
-#[derive(Debug, Deserialize)]
-struct VTResponse {
-    data: Option<VTData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VTData {
-    attributes: VTAttributes,
-}
-
-#[derive(Debug, Deserialize)]
-struct VTAttributes {
-    last_analysis_stats: VTStats,
-}
-
-#[derive(Debug, Deserialize)]
-struct VTStats {
-    malicious: i32,
-    suspicious: i32,
-}
-
-impl VirusTotal {
-    pub fn new(api_key: String) -> Self {
-        Self {
-            api_key,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
-        }
-    }
-
-    pub async fn check(&self, url: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        // VT API v3 يحتاج base64url encoding وليس percent-encoding
-        let url_id = URL_SAFE_NO_PAD.encode(url.trim_end_matches('/').as_bytes());
-
-        let response = self
-            .client
-            .get(&format!(
-                "https://www.virustotal.com/api/v3/urls/{}",
-                url_id
-            ))
-            .header("x-apikey", &self.api_key)
-            .send()
-            .await?;
-
-        // 404 = الرابط مو في قاعدة VT → نرسله للتحليل
-        if response.status() == 404 {
-            let _ = self.submit(url).await;
-            return Err("URL not in VirusTotal database".into());
+                    return Box::pin(self.inspect_with_hops(&next_url, hops + 1)).await;
+                }
+            }
+            // Redirect with no Location header is suspicious
+            return Verdict::Malicious { reason: format!("Redirect with no Location header ({})", status.as_u16()) };
         }
 
-        let body: VTResponse = response.json().await?;
+        // Step 4 — Inspect response body for phishing signals
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
 
-        if let Some(data) = body.data {
-            let stats = data.attributes.last_analysis_stats;
-            Ok(stats.malicious == 0 && stats.suspicious == 0)
-        } else {
-            Err("No analysis data".into())
+        // Only inspect HTML bodies
+        if content_type.contains("html") {
+            let body = match response.text().await {
+                Ok(b) => b.to_lowercase(),
+                Err(_) => return Verdict::Safe,
+            };
+
+            const PHISHING_SIGNALS: &[&str] = &[
+                "enter your password",
+                "verify your account",
+                "confirm your identity",
+                "your account has been suspended",
+                "claim your prize",
+                "you have been selected",
+                "free nitro",
+                "free robux",
+                "wallet connect",
+                "<input type=\"password\"",
+                "input type=password",
+            ];
+
+            for signal in PHISHING_SIGNALS {
+                if body.contains(signal) {
+                    return Verdict::Malicious { reason: format!("Phishing page detected: '{}'", signal) };
+                }
+            }
         }
-    }
 
-    async fn submit(&self, url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let params = [("url", url)];
-        self.client
-            .post("https://www.virustotal.com/api/v3/urls")
-            .header("x-apikey", &self.api_key)
-            .form(&params)
-            .send()
-            .await?;
-        println!("[VIRUSTOTAL] Submitted for analysis: {}", url);
-        Ok(())
+        Verdict::Safe
     }
 }
 
@@ -513,27 +396,20 @@ impl VirusTotal {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub struct LinkSecurityEngine {
-    google: Option<GoogleSafeBrowsing>,
-    virustotal: Option<VirusTotal>,
+    http_inspector: HttpInspector,
     pool: Option<Arc<MySqlPool>>,
     cache_ttl: i32,
-    auto_delete: bool,
 }
 
 impl LinkSecurityEngine {
     pub fn new(
-        google_key: Option<String>,
-        virustotal_key: Option<String>,
         pool: Option<Arc<MySqlPool>>,
         cache_ttl: i32,
-        auto_delete: bool,
     ) -> Self {
         Self {
-            google: google_key.map(GoogleSafeBrowsing::new),
-            virustotal: virustotal_key.map(VirusTotal::new),
+            http_inspector: HttpInspector::new(),
             pool,
             cache_ttl,
-            auto_delete,
         }
     }
 
@@ -546,10 +422,9 @@ impl LinkSecurityEngine {
                 println!("[WHITELIST:DB] ✅ whitelisted: {}", domain);
                 let result = LinkCheckResult {
                     url: url.to_string(),
-                    level: SecurityLevel::Whitelist,
-                    risk_score: 0.0,
-                    is_safe: true,
-                    reason: format!("Whitelisted: {}", domain),
+                    verdict: Verdict::Safe,
+                    user_id: None,
+                    timestamp: Utc::now().timestamp(),
                 };
                 LinkCache::set(url, result.clone(), self.cache_ttl);
                 return result;
@@ -566,163 +441,83 @@ impl LinkSecurityEngine {
         if let Some(ref pool) = self.pool {
             if let Some(cached) = db_get_url(pool, url).await {
                 println!("[CACHE:DB] ✅ hit: {} | safe={} | {}", url, cached.is_safe, cached.reason);
-                let level = match cached.classification.as_str() {
-                    "Blacklist"  => SecurityLevel::Blacklist,
-                    "Whitelist"  => SecurityLevel::Whitelist,
-                    "Suspicious" => SecurityLevel::Suspicious,
-                    _            => SecurityLevel::Unknown,
+                let verdict = if cached.is_safe {
+                    Verdict::Safe
+                } else {
+                    Verdict::Malicious { reason: cached.reason.clone() }
                 };
                 let result = LinkCheckResult {
                     url: url.to_string(),
-                    level,
-                    risk_score: cached.risk_score,
-                    is_safe: cached.is_safe,
-                    reason: cached.reason,
+                    verdict,
+                    user_id: None,
+                    timestamp: Utc::now().timestamp(),
                 };
                 LinkCache::set(url, result.clone(), self.cache_ttl);
                 return result;
             }
         }
 
-        // Level 0: Blacklist
+        // Static blacklist check
         if SecurityList::is_blacklisted(url) {
             let result = LinkCheckResult {
                 url: url.to_string(),
-                level: SecurityLevel::Blacklist,
-                risk_score: 1.0,
-                is_safe: false,
-                reason: "Known blacklisted URL".to_string(),
+                verdict: Verdict::Malicious { reason: "Known blacklisted URL".to_string() },
+                user_id: None,
+                timestamp: Utc::now().timestamp(),
             };
+            self.save(&result).await;
             LinkCache::set(url, result.clone(), self.cache_ttl);
             return result;
         }
 
-        // Level 2: Whitelist ثابتة
+        // Static whitelist check
         if SecurityList::is_whitelisted(url) {
             let result = LinkCheckResult {
                 url: url.to_string(),
-                level: SecurityLevel::Whitelist,
-                risk_score: 0.1,
-                is_safe: true,
-                reason: "In trusted whitelist".to_string(),
+                verdict: Verdict::Safe,
+                user_id: None,
+                timestamp: Utc::now().timestamp(),
             };
             LinkCache::set(url, result.clone(), self.cache_ttl);
             return result;
         }
 
-        // حساب درجة الخطر الأولية
-        let mut risk_score = RiskScorer::calculate(url);
-
-        // Level 1: Google Safe Browsing
-        if let Some(ref google) = self.google {
-            let gsb_start = Instant::now();
-            match google.check(url).await {
-                Ok(is_safe) => {
-                    println!("[GOOGLE] ⏱️ {}ms | {} | {}",
-                        gsb_start.elapsed().as_millis(),
-                        url,
-                        if is_safe { "✅ Safe" } else { "🚨 THREAT DETECTED" }
-                    );
-                    if !is_safe {
-                        let result = LinkCheckResult {
-                            url: url.to_string(),
-                            level: SecurityLevel::Blacklist,
-                            risk_score: 0.95,
-                            is_safe: false,
-                            reason: "Google Safe Browsing: threat detected".to_string(),
-                        };
-                        self.save(&result).await;
-                        LinkCache::set(url, result.clone(), self.cache_ttl);
-                        return result;
-                    }
-                }
-                Err(e) => {
-                    println!("[GOOGLE] ⏱️ {}ms | {} | ❌ Error: {}",
-                        gsb_start.elapsed().as_millis(),
-                        url,
-                        e
-                    );
-                }
-            }
-        } else {
-            println!("[GOOGLE] ⚠️ Skipped (no API key) | {}", url);
-        }
-
-        // Level 2: VirusTotal — إذا وصلنا هنا فـ Google لم يحظر الرابط
-        if let Some(ref vt) = self.virustotal {
-            let vt_start = Instant::now();
-            match vt.check(url).await {
-                Ok(is_safe) => {
-                    println!("[VIRUSTOTAL] ⏱️ {}ms | {} | {}",
-                        vt_start.elapsed().as_millis(),
-                        url,
-                        if is_safe { "✅ Safe" } else { "🚨 THREAT DETECTED" }
-                    );
-                    if !is_safe {
-                        let result = LinkCheckResult {
-                            url: url.to_string(),
-                            level: SecurityLevel::Blacklist,
-                            risk_score: 0.9,
-                            is_safe: false,
-                            reason: "VirusTotal: threat detected".to_string(),
-                        };
-                        self.save(&result).await;
-                        LinkCache::set(url, result.clone(), self.cache_ttl);
-                        return result;
-                    }
-                    risk_score = (risk_score * 0.5).min(0.3);
-                }
-                Err(e) => {
-                    println!("[VIRUSTOTAL] ❌ Error: {}", e);
-                    risk_score = (risk_score + 0.3).min(1.0);
-                }
-            }
-        }
-
-        // القرار النهائي
-        let (level, is_safe) = if risk_score > 0.7 {
-            (SecurityLevel::Suspicious, false)
-        } else if risk_score > 0.4 {
-            (SecurityLevel::Suspicious, false)
-        } else {
-            (SecurityLevel::Unknown, true)
-        };
+        // Deep HTTP inspection
+        let inspect_start = Instant::now();
+        let verdict = self.http_inspector.inspect(url).await;
+        println!("[HTTP] ⏱️ {}ms | {} | {}",
+            inspect_start.elapsed().as_millis(),
+            url,
+            if matches!(verdict, Verdict::Safe) { "✅ Safe".to_string() } else { format!("🚨 {}", verdict_reason(&verdict)) }
+        );
 
         let result = LinkCheckResult {
             url: url.to_string(),
-            level,
-            risk_score,
-            is_safe,
-            reason: if is_safe {
-                "No threats detected".to_string()
-            } else {
-                format!("Risk score: {:.0}%", risk_score * 100.0)
-            },
+            verdict,
+            user_id: None,
+            timestamp: Utc::now().timestamp(),
         };
 
-        LinkCache::set(url, result.clone(), self.cache_ttl);
         self.save(&result).await;
+        LinkCache::set(url, result.clone(), self.cache_ttl);
         result
     }
 
     /// حفظ النتيجة في الداتا بيس
     async fn save(&self, result: &LinkCheckResult) {
         if let Some(ref pool) = self.pool {
-            let classification = match result.level {
-                SecurityLevel::Blacklist  => "Blacklist",
-                SecurityLevel::Whitelist  => "Whitelist",
-                SecurityLevel::Suspicious => "Suspicious",
-                SecurityLevel::Unknown    => "Unknown",
-            };
+            let is_safe = result.is_safe();
+            let classification = if is_safe { "Safe" } else { "Malicious" };
+            let risk_score: f32 = if is_safe { 0.0 } else { 1.0 };
             // آمن = 7 أيام، خطر = 30 يوم
-            let ttl = if result.is_safe { 7 * 24 } else { 30 * 24 };
+            let ttl = if is_safe { 7 * 24 } else { 30 * 24 };
             if let Err(e) = db_save_url(
                 pool,
                 &result.url,
-                result.is_safe,
-                result.risk_score,
+                is_safe,
+                risk_score,
                 classification,
-                &result.reason,
+                result.reason(),
                 ttl,
             ).await {
                 println!("[DB] Failed to save URL: {}", e);
@@ -748,24 +543,21 @@ impl LinkSecurityEngine {
         // فحص كل رابط
         for url in urls {
             let result = self.check_url(&url).await;
-            println!("[CHECK] url={} safe={} score={:.2} reason={}", url, result.is_safe, result.risk_score, result.reason);
+            println!("[CHECK] url={} safe={} reason={}", url, result.is_safe(), result.reason());
 
-            // إذا الرابط خطر
-            if !result.is_safe {
-                return Some(if self.auto_delete {
-                    Action::Delete
-                } else {
-                    Action::Warn
-                });
-            }
-
-            // إذا الرابط مشبوه
-            if result.level == SecurityLevel::Suspicious {
-                return Some(Action::Warn);
+            if !result.is_safe() {
+                return Some(Action::Delete);
             }
         }
 
         None
+    }
+}
+
+fn verdict_reason(verdict: &Verdict) -> &str {
+    match verdict {
+        Verdict::Safe => "No threats detected",
+        Verdict::Malicious { reason } => reason.as_str(),
     }
 }
 
@@ -825,9 +617,6 @@ pub async fn handle_message(ctx: &Context, msg: &Message, engine: &LinkSecurityE
                 let _ = dm.id.send_message(&ctx.http, CreateMessage::new().content("🛡️ تم حذف رسالتك لأنها تحتوي على روابط خطيرة")).await;
             }
         }
-        Some(Action::Warn) => {
-            let _ = msg.reply(ctx, "⚠️ **تحذير:** هذه الرسالة تحتوي على روابط مشبوهة، كن حذراً!").await;
-        }
         _ => {}
     }
 }
@@ -836,10 +625,6 @@ pub async fn handle_message(ctx: &Context, msg: &Message, engine: &LinkSecurityE
 // 📝 HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════
 
-pub fn create_engine(
-    google_key: Option<String>,
-    virustotal_key: Option<String>,
-    pool: Arc<MySqlPool>,
-) -> LinkSecurityEngine {
-    LinkSecurityEngine::new(google_key, virustotal_key, Some(pool), 24, true)
+pub fn create_engine(pool: Arc<MySqlPool>) -> LinkSecurityEngine {
+    LinkSecurityEngine::new(Some(pool), 24)
 }
