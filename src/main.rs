@@ -251,10 +251,6 @@ async fn main() {
     let database_url = env::var("DATABASE_URL")
         .expect("Expected DATABASE_URL in the environment");
 
-    // إعدادات نظام الحماية
-    let google_api_key = env::var("GOOGLE_SAFE_BROWSING_API_KEY").ok();
-    let virustotal_api_key = env::var("VIRUSTOTAL_API_KEY").ok();
-
     // تهيئة قاعدة البيانات
     let pool = match database::init_database(&database_url).await {
         Ok(pool) => {
@@ -268,7 +264,7 @@ async fn main() {
     };
 
     // إنشاء محرك الحماية
-    let security_engine = link_security::create_engine(google_api_key, virustotal_api_key, Arc::clone(&pool));
+    let security_engine = link_security::create_engine(Arc::clone(&pool));
 
     // نسخة للـ graceful shutdown بعد توقف الـ client
     let pool_for_shutdown = Arc::clone(&pool);
