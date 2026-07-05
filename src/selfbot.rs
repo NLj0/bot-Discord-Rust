@@ -1,3 +1,8 @@
+mod selfbot_data;
+
+use selfbot_data::{
+    clean_text, truncate, IncomingMessage, IncomingReply, MessageStore, ProcessOutcome,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,7 +25,6 @@ struct GatewayUser {
 struct MessageReference {
     message_id: Option<String>,
     channel_id: Option<String>,
-    guild_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +35,7 @@ struct Attachment {
 
 #[derive(Debug, Deserialize)]
 struct GatewayMessage {
+    id: String,
     content: String,
     channel_id: String,
     guild_id: Option<String>,
@@ -45,34 +50,61 @@ struct GatewayMessage {
 async fn main() {
     dotenv::dotenv().ok();
 
-    println!("\n🔧 ============================================================");
-    println!("⚙️  تهيئة Selfbot (User Gateway)...");
+    println!("\n============================================================");
+    println!("Selfbot + Data Collector");
     println!("============================================================");
 
-    let token = env::var("USER_TOKEN").expect("❌ USER_TOKEN غير موجود في .env");
+    let token = env::var("USER_TOKEN").expect("USER_TOKEN missing in .env");
     let channel_filter = env::var("CHANNEL_ID").ok();
     let server_filter = env::var("SERVER_ID")
         .or_else(|_| env::var("GUILD_ID"))
         .ok();
+    let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let backfill = env::var("BACKFILL")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
 
-    if let Some(ref channel_id) = channel_filter {
-        println!("🎯 فلتر القناة: {}", channel_id);
-    }
-    if let Some(ref server_id) = server_filter {
-        println!("🎯 فلتر السيرفر: {}", server_id);
+    let store = Arc::new(Mutex::new(
+        MessageStore::load(&data_dir)
+            .await
+            .expect("Failed to initialize data store"),
+    ));
+
+    if backfill {
+        if let Err(error) = backfill_recent_messages(
+            &token,
+            channel_filter.as_deref(),
+            server_filter.as_deref(),
+            Arc::clone(&store),
+        )
+        .await
+        {
+            eprintln!("Backfill warning: {}", error);
+        }
     }
 
-    println!("🔄 جاري الاتصال بـ Discord...\n");
+    if let Some(channel_id) = &channel_filter {
+        println!("Channel filter: {}", channel_id);
+    }
+    if let Some(server_id) = &server_filter {
+        println!("Server filter: {}", server_id);
+    }
+    println!("Data directory: {}", data_dir);
+    println!("Connecting to Discord...\n");
 
     loop {
-        match run_gateway(&token, channel_filter.as_deref(), server_filter.as_deref()).await {
-            Ok(()) => {
-                println!("🔌 انقطع الاتصال، إعادة المحاولة بعد 5 ثوان...");
-            }
-            Err(error) => {
-                eprintln!("❌ خطأ: {}", error);
-                eprintln!("🔄 إعادة المحاولة بعد 5 ثوان...");
-            }
+        let store = Arc::clone(&store);
+        match run_gateway(
+            &token,
+            channel_filter.as_deref(),
+            server_filter.as_deref(),
+            store,
+        )
+        .await
+        {
+            Ok(()) => println!("Disconnected. Retrying in 5 seconds..."),
+            Err(error) => eprintln!("Error: {}. Retrying in 5 seconds...", error),
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -83,6 +115,7 @@ async fn run_gateway(
     token: &str,
     channel_filter: Option<&str>,
     server_filter: Option<&str>,
+    store: Arc<Mutex<MessageStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = connect_async(GATEWAY_URL).await?;
     let (write, mut read) = ws_stream.split();
@@ -94,9 +127,7 @@ async fn run_gateway(
         let message = message?;
         let text = match message {
             WsMessage::Text(text) => text,
-            WsMessage::Close(frame) => {
-                return Err(format!("Gateway closed: {:?}", frame).into());
-            }
+            WsMessage::Close(frame) => return Err(format!("Gateway closed: {:?}", frame).into()),
             WsMessage::Ping(data) => {
                 write.lock().await.send(WsMessage::Pong(data)).await?;
                 continue;
@@ -142,11 +173,12 @@ async fn run_gateway(
                     }
                 }));
 
-                let identify = build_identify_payload(token);
                 write
                     .lock()
                     .await
-                    .send(WsMessage::Text(identify.to_string()))
+                    .send(WsMessage::Text(
+                        build_identify_payload(token).to_string(),
+                    ))
                     .await?;
             }
             0 => match payload["t"].as_str() {
@@ -158,18 +190,14 @@ async fn run_gateway(
                         .as_str()
                         .unwrap_or("unknown");
 
-                    println!("🚀 ============================================================");
-                    println!("✅ Selfbot متصل بنجاح!");
-                    println!("👤 الحساب: {}", username);
-                    println!("🆔 ID: {}", user_id);
-                    println!("📡 جاهز لقراءة الرسائل...");
-                    println!("============================================================\n");
+                    println!("Connected as {} ({})", username, user_id);
+                    println!("Listening for messages...\n");
                 }
                 Some("MESSAGE_CREATE") => {
                     if let Ok(message) =
                         serde_json::from_value::<GatewayMessage>(payload["d"].clone())
                     {
-                        handle_message(&message, channel_filter, server_filter);
+                        handle_message(&message, channel_filter, server_filter, &store).await;
                     }
                 }
                 _ => {}
@@ -188,6 +216,155 @@ async fn run_gateway(
     }
 
     Ok(())
+}
+
+async fn handle_message(
+    message: &GatewayMessage,
+    channel_filter: Option<&str>,
+    server_filter: Option<&str>,
+    store: &Arc<Mutex<MessageStore>>,
+) {
+    if let Some(filter) = channel_filter {
+        if message.channel_id != filter {
+            return;
+        }
+    }
+
+    if let Some(filter) = server_filter {
+        if let Some(guild_id) = message.guild_id.as_deref() {
+            if guild_id != filter {
+                return;
+            }
+        }
+    }
+
+    let reply_to = message.referenced_message.as_ref().map(|referenced| {
+        IncomingReply {
+            message_id: referenced.id.clone(),
+            author_id: referenced.author.id.clone(),
+            author_name: referenced.author.username.clone(),
+            content: referenced.content.clone(),
+        }
+    });
+
+    let incoming = IncomingMessage {
+        id: message.id.clone(),
+        author_id: message.author.id.clone(),
+        author_name: message.author.username.clone(),
+        content: message.content.clone(),
+        channel_id: message.channel_id.clone(),
+        guild_id: message.guild_id.clone(),
+        timestamp: message.timestamp.clone(),
+        is_bot: message.author.bot.unwrap_or(false),
+        reply_to,
+    };
+
+    let mut store = store.lock().await;
+    let outcome = match store.process(incoming).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("Failed to process message {}: {}", message.id, error);
+            return;
+        }
+    };
+
+    let cleaned = clean_text(&message.content);
+    if cleaned.is_empty() {
+        return;
+    }
+
+    match outcome {
+        ProcessOutcome::Saved => {
+            println!("\n============================================================");
+            println!("Saved message");
+            println!("============================================================");
+            println!("Author: {} ({})", message.author.username, message.author.id);
+            println!("Channel: {}", message.channel_id);
+            if let Some(guild_id) = &message.guild_id {
+                println!("Server: {}", guild_id);
+            }
+            if let Some(referenced) = &message.referenced_message {
+                println!(
+                    "Reply to: {} ({})",
+                    referenced.author.username, referenced.author.id
+                );
+                let ref_content = clean_text(&referenced.content);
+                if !ref_content.is_empty() {
+                    println!("Original: \"{}\"", truncate(&ref_content, 100));
+                }
+            } else if let Some(reference) = &message.message_reference {
+                if let Some(message_id) = &reference.message_id {
+                    println!("Reply to message ID: {}", message_id);
+                }
+            }
+            println!("Time: {}", message.timestamp);
+            println!("Content: \"{}\"", cleaned);
+            print_stats(&store);
+            println!("============================================================\n");
+        }
+        ProcessOutcome::SkippedDuplicateId => {
+            println!("Skipped duplicate message ID: {}", message.id);
+        }
+        ProcessOutcome::SkippedDuplicateContent => {
+            println!("Skipped duplicate content from {}", message.author.username);
+        }
+        ProcessOutcome::SkippedLowQuality => {
+            println!("Skipped low quality message from {}", message.author.username);
+        }
+        ProcessOutcome::SkippedBot | ProcessOutcome::SkippedEmpty => {}
+    }
+}
+
+async fn backfill_recent_messages(
+    token: &str,
+    channel_filter: Option<&str>,
+    server_filter: Option<&str>,
+    store: Arc<Mutex<MessageStore>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(channel_id) = channel_filter else {
+        return Ok(());
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages?limit=50"
+        ))
+        .header("Authorization", token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Backfill failed with status {}", response.status()).into());
+    }
+
+    let messages: Vec<GatewayMessage> = response.json().await?;
+    println!("Backfilling {} recent messages...", messages.len());
+
+    for message in messages.into_iter().rev() {
+        handle_message(&message, Some(channel_id), server_filter, &store).await;
+    }
+
+    let stats = store.lock().await.stats().clone();
+    println!(
+        "Backfill done. saved={} duplicates={} low_quality={}",
+        stats.saved,
+        stats.skipped_duplicate_id + stats.skipped_duplicate_content,
+        stats.skipped_low_quality
+    );
+
+    Ok(())
+}
+
+fn print_stats(store: &MessageStore) {
+    let stats = store.stats();
+    println!(
+        "Stats: saved={} duplicates={} low_quality={} total_seen={}",
+        stats.saved,
+        stats.skipped_duplicate_id + stats.skipped_duplicate_content,
+        stats.skipped_low_quality,
+        stats.total_seen
+    );
 }
 
 fn build_identify_payload(token: &str) -> Value {
@@ -224,121 +401,4 @@ fn build_identify_payload(token: &str) -> Value {
             }
         }
     })
-}
-
-fn handle_message(
-    message: &GatewayMessage,
-    channel_filter: Option<&str>,
-    server_filter: Option<&str>,
-) {
-    if message.author.bot.unwrap_or(false) {
-        return;
-    }
-
-    if let Some(filter) = channel_filter {
-        if message.channel_id != filter {
-            return;
-        }
-    }
-
-    if let Some(filter) = server_filter {
-        if message.guild_id.as_deref() != Some(filter) {
-            return;
-        }
-    }
-
-    let content = clean_text(&message.content);
-    if content.is_empty() {
-        return;
-    }
-
-    println!("\n============================================================");
-    println!("📨 رسالة جديدة");
-    println!("============================================================");
-    println!(
-        "👤 المرسل: {} (ID: {})",
-        message.author.username, message.author.id
-    );
-    println!("📍 القناة ID: {}", message.channel_id);
-
-    if let Some(guild_id) = &message.guild_id {
-        println!("🏠 السيرفر ID: {}", guild_id);
-    }
-
-    if let Some(referenced) = &message.referenced_message {
-        println!(
-            "↩️  رد على: {} (ID: {})",
-            referenced.author.username, referenced.author.id
-        );
-        let ref_content = clean_text(&referenced.content);
-        if !ref_content.is_empty() {
-            println!("   💬 الرسالة الأصلية: \"{}\"", truncate(&ref_content, 100));
-        }
-    } else if let Some(reference) = &message.message_reference {
-        if let Some(message_id) = &reference.message_id {
-            println!("↩️  رد على رسالة ID: {}", message_id);
-        }
-        if let Some(reference_channel) = &reference.channel_id {
-            println!("   📍 في قناة ID: {}", reference_channel);
-        }
-    }
-
-    println!("🕐 الوقت: {}", message.timestamp);
-    println!("💬 المحتوى:");
-    println!("   \"{}\"", content);
-
-    if let Some(attachments) = &message.attachments {
-        if !attachments.is_empty() {
-            println!("📎 المرفقات ({}):", attachments.len());
-            for (index, attachment) in attachments.iter().enumerate() {
-                let content_type = attachment
-                    .content_type
-                    .as_deref()
-                    .unwrap_or("unknown");
-                println!(
-                    "   {}. {} ({})",
-                    index + 1,
-                    attachment.filename,
-                    content_type
-                );
-            }
-        }
-    }
-
-    println!("============================================================\n");
-}
-
-fn clean_text(text: &str) -> String {
-    text.chars()
-        .filter(|character| {
-            matches!(
-                character,
-                '\u{0600}'..='\u{06FF}'
-                    | 'a'..='z'
-                    | 'A'..='Z'
-                    | '0'..='9'
-                    | ' '
-                    | '.'
-                    | ','
-                    | '!'
-                    | '?'
-                    | ':'
-                    | ';'
-                    | '-'
-                    | '_'
-                    | '\n'
-            )
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        format!("{}...", text.chars().take(max_chars).collect::<String>())
-    }
 }
