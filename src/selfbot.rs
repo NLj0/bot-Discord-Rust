@@ -63,7 +63,7 @@ async fn main() {
     let backfill = env::var("BACKFILL")
         .ok()
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+        .unwrap_or(false);
     let backfill_limit = env::var("BACKFILL_LIMIT")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

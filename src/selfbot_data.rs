@@ -478,21 +478,80 @@ fn is_mostly_extended_chars(content: &str) -> bool {
 }
 
 fn is_toxic(content: &str) -> bool {
-    let lower = content.to_lowercase();
+    let normalized = normalize_for_toxic_check(content);
+
     const BLOCKED: &[&str] = &[
         "خرا",
+        "الخرا",
         "لعنه",
         "لعنة",
-        "كس ",
+        "لعن",
+        "كس",
         "طيز",
+        "زق",
+        "على زق",
+        "قذف",
+        "قح",
+        "قحب",
+        "شرمو",
+        "معرص",
         "ادعس",
         "انيك",
+        "نيك",
+        "ياكلب",
+        "كلب",
+        "وصخ",
+        "وسخ",
+        "سدحلق",
+        "لحس",
+        "متناك",
+        "منيوك",
         "fuck",
         "shit",
         "bitch",
+        "asshole",
+        "dick",
     ];
 
-    BLOCKED.iter().any(|word| lower.contains(word))
+    if BLOCKED.iter().any(|word| normalized.contains(word)) {
+        return true;
+    }
+
+    // Insult patterns that are common in Saudi chat.
+    let insult_patterns = [
+        " ادعس ",
+        " على زق",
+        " ياكلب",
+        " يا كلب",
+        " وصخ",
+        " وسخ",
+        " سدح ",
+        " قذف ",
+    ];
+
+    let padded = format!(" {normalized} ");
+    insult_patterns.iter().any(|pattern| padded.contains(pattern))
+}
+
+fn normalize_for_toxic_check(content: &str) -> String {
+    let mut normalized = content.to_lowercase();
+
+    for (from, to) in [
+        ('أ', "ا"),
+        ('إ', "ا"),
+        ('آ', "ا"),
+        ('ة', "ه"),
+        ('ى', "ي"),
+        ('ؤ', "و"),
+        ('ئ', "ي"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
+
+    collapse_repetitions(&normalized)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_mostly_noise(content: &str) -> bool {
@@ -589,7 +648,11 @@ mod tests {
 
         assert!(validate_content("هههههههههههههههههههه").is_err());
         assert!(validate_content("896240360077025281 ادعس لونك الخرا").is_err());
+        assert!(validate_content("Dody على زق").is_err());
+        assert!(validate_content("ياكلب ههه").is_err());
+        assert!(validate_content("يب يب وصخ").is_err());
         assert!(validate_content("نعم").is_err());
         assert!(validate_content("وش ودك").is_ok());
+        assert!(validate_content("السلام عليكم").is_ok());
     }
 }
