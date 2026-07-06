@@ -7,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
@@ -60,6 +61,7 @@ async fn main() {
         .or_else(|_| env::var("GUILD_ID"))
         .ok();
     let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    ensure_single_instance(&data_dir);
     let backfill = env::var("BACKFILL")
         .ok()
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -591,6 +593,23 @@ fn print_final_report(stats: &selfbot_data::StoreStats) {
         );
     }
     println!("============================================================");
+}
+
+fn ensure_single_instance(data_dir: &str) {
+    let state_dir = PathBuf::from(data_dir).join("state");
+    std::fs::create_dir_all(&state_dir).ok();
+    let lock_path = state_dir.join("selfbot.lock");
+
+    if lock_path.exists() {
+        let existing = std::fs::read_to_string(&lock_path).unwrap_or_default();
+        eprintln!("ERROR: Another selfbot is already running (pid {}).", existing.trim());
+        eprintln!("Stop it first with stop-bot.bat, or delete: {}", lock_path.display());
+        std::process::exit(1);
+    }
+
+    if let Err(error) = std::fs::write(&lock_path, std::process::id().to_string()) {
+        eprintln!("Failed to create lock file: {error}");
+    }
 }
 
 fn build_identify_payload(token: &str) -> Value {
