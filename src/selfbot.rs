@@ -95,8 +95,33 @@ async fn main() {
     if let Some(server_id) = &server_filter {
         println!("Server filter: {}", server_id);
     }
+    let live_poll_secs = env::var("LIVE_POLL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2);
     println!("Data directory: {}", data_dir);
+    if !backfill {
+        println!("Live poll interval: {}s (real-time capture)", live_poll_secs);
+    }
     println!("Connecting to Discord...\n");
+
+    if !backfill {
+        if let Some(channel_id) = channel_filter.clone() {
+            let poll_token = token.clone();
+            let poll_server = server_filter.clone();
+            let poll_store = Arc::clone(&store);
+            tokio::spawn(async move {
+                run_live_poll(
+                    &poll_token,
+                    &channel_id,
+                    poll_server.as_deref(),
+                    poll_store,
+                    live_poll_secs,
+                )
+                .await;
+            });
+        }
+    }
 
     loop {
         let store = Arc::clone(&store);
@@ -108,8 +133,8 @@ async fn main() {
         )
         .await
         {
-            Ok(()) => println!("Disconnected. Retrying in 5 seconds..."),
-            Err(error) => eprintln!("Error: {}. Retrying in 5 seconds...", error),
+            Ok(()) => println!("Gateway disconnected. Retrying in 5 seconds..."),
+            Err(error) => eprintln!("Gateway error: {}. Retrying in 5 seconds...", error),
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -196,14 +221,48 @@ async fn run_gateway(
                         .unwrap_or("unknown");
 
                     println!("Connected as {} ({})", username, user_id);
-                    println!("Listening for messages...\n");
+                    println!("Listening for messages (gateway + live poll)...\n");
+
+                    if let (Some(guild_id), Some(channel_id)) = (server_filter, channel_filter) {
+                        let lazy = json!({
+                            "op": 14,
+                            "d": {
+                                "guild_id": guild_id,
+                                "typing": true,
+                                "activities": true,
+                                "threads": true,
+                                "channels": {
+                                    channel_id: [[0, 99]]
+                                }
+                            }
+                        });
+                        if write
+                            .lock()
+                            .await
+                            .send(WsMessage::Text(lazy.to_string()))
+                            .await
+                            .is_ok()
+                        {
+                            println!("Subscribed to channel {} in guild {}", channel_id, guild_id);
+                        }
+                    }
                 }
                 Some("MESSAGE_CREATE") => {
-                    if let Ok(message) =
-                        serde_json::from_value::<GatewayMessage>(payload["d"].clone())
-                    {
-                        handle_message(&message, channel_filter, server_filter, &store, false)
+                    match serde_json::from_value::<GatewayMessage>(payload["d"].clone()) {
+                        Ok(message) => {
+                            handle_message(
+                                &message,
+                                channel_filter,
+                                server_filter,
+                                &store,
+                                false,
+                                "GW",
+                            )
                             .await;
+                        }
+                        Err(error) => {
+                            eprintln!("Gateway MESSAGE_CREATE parse error: {}", error);
+                        }
                     }
                 }
                 _ => {}
@@ -224,12 +283,74 @@ async fn run_gateway(
     Ok(())
 }
 
+async fn run_live_poll(
+    token: &str,
+    channel_id: &str,
+    server_filter: Option<&str>,
+    store: Arc<Mutex<MessageStore>>,
+    poll_secs: u64,
+) {
+    let client = reqwest::Client::new();
+    let mut ticker = interval(Duration::from_secs(poll_secs));
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages?limit=10"
+        );
+        let response = match client
+            .get(&url)
+            .header("Authorization", token)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("Live poll request failed: {}", error);
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            eprintln!("Live poll failed with status {}", response.status());
+            continue;
+        }
+
+        let messages: Vec<GatewayMessage> = match response.json().await {
+            Ok(messages) => messages,
+            Err(error) => {
+                eprintln!("Live poll parse failed: {}", error);
+                continue;
+            }
+        };
+
+        for message in messages.into_iter().rev() {
+            let mut message = message;
+            if message.guild_id.is_none() {
+                message.guild_id = server_filter.map(str::to_string);
+            }
+            handle_message(
+                &message,
+                Some(channel_id),
+                server_filter,
+                &store,
+                false,
+                "LIVE",
+            )
+            .await;
+        }
+    }
+}
+
 async fn handle_message(
     message: &GatewayMessage,
     channel_filter: Option<&str>,
     server_filter: Option<&str>,
     store: &Arc<Mutex<MessageStore>>,
     quiet: bool,
+    source: &str,
 ) {
     if let Some(filter) = channel_filter {
         if message.channel_id != filter {
@@ -276,6 +397,21 @@ async fn handle_message(
     };
 
     let cleaned = clean_text(&message.content);
+    let preview = if cleaned.is_empty() {
+        "(empty/sticker)".to_string()
+    } else {
+        truncate(&cleaned, 80)
+    };
+
+    if !quiet
+        && !matches!(
+            outcome,
+            ProcessOutcome::SkippedDuplicateId | ProcessOutcome::SkippedDuplicateContent
+        )
+    {
+        print_live_line(source, &message.author.username, &preview, outcome);
+    }
+
     if cleaned.is_empty() {
         return;
     }
@@ -310,33 +446,23 @@ async fn handle_message(
             print_stats(&store);
             println!("============================================================\n");
         }
-        ProcessOutcome::SkippedDuplicateId if !quiet => {
-            println!("Skipped duplicate message ID: {}", message.id);
-        }
-        ProcessOutcome::SkippedDuplicateContent if !quiet => {
-            println!("Skipped duplicate content from {}", message.author.username);
-        }
-        ProcessOutcome::SkippedLowQuality if !quiet => {
-            println!("Skipped low quality message from {}", message.author.username);
-        }
-        ProcessOutcome::SkippedSpam if !quiet => {
-            println!("Skipped spam from {}", message.author.username);
-        }
-        ProcessOutcome::SkippedToxic if !quiet => {
-            println!("Skipped toxic message from {}", message.author.username);
-        }
-        ProcessOutcome::SkippedTooShort if !quiet => {
-            println!("Skipped short message from {}", message.author.username);
-        }
-        ProcessOutcome::SkippedDuplicateId
-        | ProcessOutcome::SkippedDuplicateContent
-        | ProcessOutcome::SkippedLowQuality
-        | ProcessOutcome::SkippedSpam
-        | ProcessOutcome::SkippedToxic
-        | ProcessOutcome::SkippedTooShort
-        | ProcessOutcome::SkippedBot
-        | ProcessOutcome::SkippedEmpty => {}
+        _ => {}
     }
+}
+
+fn print_live_line(source: &str, author: &str, preview: &str, outcome: ProcessOutcome) {
+    let label = match outcome {
+        ProcessOutcome::Saved => "SAVED",
+        ProcessOutcome::SkippedToxic => "TOXIC",
+        ProcessOutcome::SkippedSpam => "SPAM",
+        ProcessOutcome::SkippedTooShort => "SHORT",
+        ProcessOutcome::SkippedEmpty => "EMPTY",
+        ProcessOutcome::SkippedDuplicateId => "DUP-ID",
+        ProcessOutcome::SkippedDuplicateContent => "DUP",
+        ProcessOutcome::SkippedLowQuality => "LOW-Q",
+        ProcessOutcome::SkippedBot => "BOT",
+    };
+    println!("[{source}] {author}: \"{preview}\" => {label}");
 }
 
 async fn backfill_recent_messages(
@@ -397,6 +523,7 @@ async fn backfill_recent_messages(
             server_filter,
             &store,
             quiet,
+            "BACKFILL",
         )
         .await;
     }
