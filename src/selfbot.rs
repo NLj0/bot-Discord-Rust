@@ -64,6 +64,10 @@ async fn main() {
         .ok()
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let backfill_only = env::var("BACKFILL_ONLY")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let backfill_limit = env::var("BACKFILL_LIMIT")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -86,6 +90,13 @@ async fn main() {
         .await
         {
             eprintln!("Backfill warning: {}", error);
+        }
+
+        if backfill_only {
+            let stats = store.lock().await.stats().clone();
+            println!("\nBackfill-only mode complete.");
+            print_final_report(&stats);
+            return;
         }
     }
 
@@ -554,6 +565,32 @@ fn print_stats(store: &MessageStore) {
         stats.skipped_too_short,
         stats.total_seen
     );
+}
+
+fn print_final_report(stats: &selfbot_data::StoreStats) {
+    println!("============================================================");
+    println!("FINAL REPORT");
+    println!("============================================================");
+    println!("Total seen:        {}", stats.total_seen);
+    println!("Saved messages:    {}", stats.saved);
+    println!("Training pairs:    {}", stats.training_pairs_saved);
+    println!("Skipped toxic:     {}", stats.skipped_toxic);
+    println!("Skipped spam:      {}", stats.skipped_spam);
+    println!("Skipped short:     {}", stats.skipped_too_short);
+    println!("Skipped empty:     {}", stats.skipped_empty);
+    println!("Skipped low qual:  {}", stats.skipped_low_quality);
+    println!("Skipped duplicate: {}", stats.skipped_duplicate_id + stats.skipped_duplicate_content);
+    if stats.total_seen > 0 {
+        println!(
+            "Save rate:         {:.1}%",
+            stats.saved as f64 / stats.total_seen as f64 * 100.0
+        );
+        println!(
+            "Training rate:     {:.1}%",
+            stats.training_pairs_saved as f64 / stats.total_seen as f64 * 100.0
+        );
+    }
+    println!("============================================================");
 }
 
 fn build_identify_payload(token: &str) -> Value {

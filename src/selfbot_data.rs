@@ -7,15 +7,22 @@ use std::path::{Path, PathBuf};
 use tokio::fs::{create_dir_all, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-const MIN_QUALITY: f32 = 0.68;
-const MIN_TRAINING_QUALITY: f32 = 0.75;
+const MIN_QUALITY: f32 = 0.72;
+const MIN_TRAINING_QUALITY: f32 = 0.82;
 const MIN_CHARS: usize = 6;
-const MIN_TRAINING_CHARS: usize = 8;
+const MIN_TRAINING_CHARS: usize = 10;
+const MIN_TRAINING_WORDS: usize = 2;
 const MAX_TRAINING_CHARS: usize = 180;
 const MAX_TRAINING_WORDS: usize = 22;
 
 static MENTION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"<@!?[0-9]+>").unwrap());
 static SNOWFLAKE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[0-9]{17,20}\b").unwrap());
+static CUSTOM_EMOJI_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)[a-z]?:[a-z0-9_]{2,32}:").unwrap());
+static URL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(https?://|discord(?:app)?\.com|www\.)[^\s]+").unwrap());
+static LAUGHTER_TAIL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)[؟?!.\s]*(ه{2,}|هه+|ح{2,}|ha+h*)$").unwrap());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyContext {
@@ -111,9 +118,8 @@ impl MessageStore {
         &mut self,
         input: IncomingMessage,
     ) -> Result<ProcessOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        self.stats.total_seen += 1;
-
         if input.is_bot {
+            self.stats.total_seen += 1;
             self.stats.skipped_bot += 1;
             return Ok(ProcessOutcome::SkippedBot);
         }
@@ -122,6 +128,8 @@ impl MessageStore {
             self.stats.skipped_duplicate_id += 1;
             return Ok(ProcessOutcome::SkippedDuplicateId);
         }
+
+        self.stats.total_seen += 1;
 
         let content = match validate_content(&input.content) {
             Ok(cleaned) => cleaned,
@@ -208,12 +216,17 @@ impl MessageStore {
             return Ok(());
         };
 
+        let parent_words = parent.content.split_whitespace().count();
+        let output_words = stored.content.split_whitespace().count();
+
         if parent.content.chars().count() < MIN_TRAINING_CHARS
             || stored.content.chars().count() < MIN_TRAINING_CHARS
             || parent.content.chars().count() > MAX_TRAINING_CHARS
             || stored.content.chars().count() > MAX_TRAINING_CHARS
-            || parent.content.split_whitespace().count() > MAX_TRAINING_WORDS
-            || stored.content.split_whitespace().count() > MAX_TRAINING_WORDS
+            || parent_words < MIN_TRAINING_WORDS
+            || output_words < MIN_TRAINING_WORDS
+            || parent_words > MAX_TRAINING_WORDS
+            || output_words > MAX_TRAINING_WORDS
         {
             return Ok(());
         }
@@ -223,7 +236,15 @@ impl MessageStore {
             return Ok(());
         }
 
-        if is_laughter_spam(&parent.content) || is_laughter_spam(&stored.content) {
+        if !is_training_worthy(&parent.content) || !is_training_worthy(&stored.content) {
+            return Ok(());
+        }
+
+        if is_laughter_spam(&parent.content)
+            || is_laughter_spam(&stored.content)
+            || has_laughter_tail(&parent.content)
+            || has_laughter_tail(&stored.content)
+        {
             return Ok(());
         }
 
@@ -330,8 +351,10 @@ pub fn clean_text(text: &str) -> String {
 }
 
 fn normalize_text(text: &str, mention_regex: &Regex, snowflake_regex: &Regex) -> String {
-    let without_mentions = mention_regex.replace_all(text, " ");
-    let collapsed = collapse_repetitions(&without_mentions);
+    let without_urls = URL_REGEX.replace_all(text, " ");
+    let without_mentions = mention_regex.replace_all(&without_urls, " ");
+    let without_custom_emoji = CUSTOM_EMOJI_REGEX.replace_all(&without_mentions, " ");
+    let collapsed = collapse_repetitions(&without_custom_emoji);
     let filtered: String = collapsed
         .chars()
         .filter(|character| {
@@ -346,10 +369,8 @@ fn normalize_text(text: &str, mention_regex: &Regex, snowflake_regex: &Regex) ->
                     | ','
                     | '!'
                     | '?'
-                    | ':'
                     | ';'
                     | '-'
-                    | '_'
             )
         })
         .collect();
@@ -372,12 +393,19 @@ fn validate_content(text: &str) -> Result<String, ProcessOutcome> {
         return Err(ProcessOutcome::SkippedToxic);
     }
 
-    if is_laughter_spam(&content) || is_mostly_extended_chars(&content) {
+    if is_laughter_spam(&content)
+        || is_mostly_extended_chars(&content)
+        || has_laughter_tail(&content)
+    {
         return Err(ProcessOutcome::SkippedSpam);
     }
 
     if has_excessive_repetition(&content) {
         return Err(ProcessOutcome::SkippedSpam);
+    }
+
+    if is_discord_artifact(&content) {
+        return Err(ProcessOutcome::SkippedLowQuality);
     }
 
     if content.chars().count() < MIN_CHARS {
@@ -389,6 +417,44 @@ fn validate_content(text: &str) -> Result<String, ProcessOutcome> {
     }
 
     Ok(content)
+}
+
+fn is_discord_artifact(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("discord.com")
+        || lower.contains("discordapp.com")
+        || lower.contains("http")
+        || lower.contains("www.")
+        || lower.starts_with("channels/")
+}
+
+fn is_training_worthy(content: &str) -> bool {
+    if is_discord_artifact(content) {
+        return false;
+    }
+
+    let words = content.split_whitespace().count();
+    let chars = content.chars().count();
+
+    words >= MIN_TRAINING_WORDS && chars >= MIN_TRAINING_CHARS && contains_arabic(content)
+}
+
+fn has_laughter_tail(content: &str) -> bool {
+    let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return false;
+    }
+
+    if LAUGHTER_TAIL_REGEX.is_match(&compact) {
+        return true;
+    }
+
+    let laugh_chars = compact
+        .chars()
+        .filter(|c| matches!(c, 'ه' | 'ح' | 'h' | 'H'))
+        .count();
+
+    compact.chars().count() <= 12 && laugh_chars >= 2
 }
 
 fn collapse_repetitions(content: &str) -> String {
@@ -442,6 +508,9 @@ fn score_content(content: &str) -> f32 {
     }
     if is_laughter_spam(content) {
         score -= 0.5;
+    }
+    if has_laughter_tail(content) {
+        score -= 0.35;
     }
     if is_toxic(content) {
         score -= 0.8;
@@ -506,6 +575,11 @@ fn is_toxic(content: &str) -> bool {
         "لحس",
         "متناك",
         "منيوك",
+        "عديم اخلاق",
+        "بدون اخلاق",
+        "حمار",
+        "غبي",
+        "حقير",
         "fuck",
         "shit",
         "bitch",
@@ -654,5 +728,30 @@ mod tests {
         assert!(validate_content("نعم").is_err());
         assert!(validate_content("وش ودك").is_ok());
         assert!(validate_content("السلام عليكم").is_ok());
+    }
+
+    #[test]
+    fn strips_custom_emoji_and_urls() {
+        assert_eq!(
+            clean_text("هلا :Laughed: https://discord.com/channels/123"),
+            "هلا"
+        );
+        assert_eq!(clean_text("انتي النور a:Cute:"), "انتي النور");
+        assert!(validate_content("https://discord.com/channels/766953289409232896").is_err());
+    }
+
+    #[test]
+    fn blocks_laughter_tails_and_borderline_toxic() {
+        assert!(validate_content("؟؟؟ ههه").is_err());
+        assert!(validate_content("وربي ههه").is_err());
+        assert!(validate_content("مايدري انك عديم اخلاق ها").is_err());
+        assert!(validate_content("وش اخبارك اليوم").is_ok());
+    }
+
+    #[test]
+    fn training_worthy_requires_arabic_and_length() {
+        assert!(!is_training_worthy("ok thanks"));
+        assert!(!is_training_worthy("هلا"));
+        assert!(is_training_worthy("وش اخبارك اليوم"));
     }
 }

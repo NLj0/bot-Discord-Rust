@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "selfbot"
 path = "src/selfbot.rs"
 
+[[bin]]
+name = "export_training"
+path = "src/export_training.rs"
+
 [dependencies]
 serenity = { version = "0.11", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 tokio = { version = "1.35", features = ["full"] }
