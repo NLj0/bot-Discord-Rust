@@ -64,6 +64,10 @@ async fn main() {
         .ok()
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(true);
+    let backfill_limit = env::var("BACKFILL_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50);
 
     let store = Arc::new(Mutex::new(
         MessageStore::load(&data_dir)
@@ -77,6 +81,7 @@ async fn main() {
             channel_filter.as_deref(),
             server_filter.as_deref(),
             Arc::clone(&store),
+            backfill_limit,
         )
         .await
         {
@@ -197,7 +202,8 @@ async fn run_gateway(
                     if let Ok(message) =
                         serde_json::from_value::<GatewayMessage>(payload["d"].clone())
                     {
-                        handle_message(&message, channel_filter, server_filter, &store).await;
+                        handle_message(&message, channel_filter, server_filter, &store, false)
+                            .await;
                     }
                 }
                 _ => {}
@@ -223,6 +229,7 @@ async fn handle_message(
     channel_filter: Option<&str>,
     server_filter: Option<&str>,
     store: &Arc<Mutex<MessageStore>>,
+    quiet: bool,
 ) {
     if let Some(filter) = channel_filter {
         if message.channel_id != filter {
@@ -274,6 +281,7 @@ async fn handle_message(
     }
 
     match outcome {
+        ProcessOutcome::Saved if quiet => {}
         ProcessOutcome::Saved => {
             println!("\n============================================================");
             println!("Saved message");
@@ -302,25 +310,32 @@ async fn handle_message(
             print_stats(&store);
             println!("============================================================\n");
         }
-        ProcessOutcome::SkippedDuplicateId => {
+        ProcessOutcome::SkippedDuplicateId if !quiet => {
             println!("Skipped duplicate message ID: {}", message.id);
         }
-        ProcessOutcome::SkippedDuplicateContent => {
+        ProcessOutcome::SkippedDuplicateContent if !quiet => {
             println!("Skipped duplicate content from {}", message.author.username);
         }
-        ProcessOutcome::SkippedLowQuality => {
+        ProcessOutcome::SkippedLowQuality if !quiet => {
             println!("Skipped low quality message from {}", message.author.username);
         }
-        ProcessOutcome::SkippedSpam => {
+        ProcessOutcome::SkippedSpam if !quiet => {
             println!("Skipped spam from {}", message.author.username);
         }
-        ProcessOutcome::SkippedToxic => {
+        ProcessOutcome::SkippedToxic if !quiet => {
             println!("Skipped toxic message from {}", message.author.username);
         }
-        ProcessOutcome::SkippedTooShort => {
+        ProcessOutcome::SkippedTooShort if !quiet => {
             println!("Skipped short message from {}", message.author.username);
         }
-        ProcessOutcome::SkippedBot | ProcessOutcome::SkippedEmpty => {}
+        ProcessOutcome::SkippedDuplicateId
+        | ProcessOutcome::SkippedDuplicateContent
+        | ProcessOutcome::SkippedLowQuality
+        | ProcessOutcome::SkippedSpam
+        | ProcessOutcome::SkippedToxic
+        | ProcessOutcome::SkippedTooShort
+        | ProcessOutcome::SkippedBot
+        | ProcessOutcome::SkippedEmpty => {}
     }
 }
 
@@ -329,39 +344,73 @@ async fn backfill_recent_messages(
     channel_filter: Option<&str>,
     server_filter: Option<&str>,
     store: Arc<Mutex<MessageStore>>,
+    limit: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(channel_id) = channel_filter else {
         return Ok(());
     };
 
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "https://discord.com/api/v10/channels/{channel_id}/messages?limit=50"
-        ))
-        .header("Authorization", token)
-        .send()
-        .await?;
+    let mut collected = Vec::new();
+    let mut before: Option<String> = None;
+    let quiet = limit > 50;
 
-    if !response.status().is_success() {
-        return Err(format!("Backfill failed with status {}", response.status()).into());
+    while collected.len() < limit {
+        let batch_size = (limit - collected.len()).min(100);
+        let mut url = format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages?limit={batch_size}"
+        );
+        if let Some(message_id) = &before {
+            url.push_str(&format!("&before={message_id}"));
+        }
+
+        let response = client
+            .get(&url)
+            .header("Authorization", token)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(format!("Backfill failed with status {}", response.status()).into());
+        }
+
+        let messages: Vec<GatewayMessage> = response.json().await?;
+        if messages.is_empty() {
+            break;
+        }
+
+        before = messages.last().map(|message| message.id.clone());
+        collected.extend(messages);
+
+        if collected.len() >= limit {
+            collected.truncate(limit);
+            break;
+        }
     }
 
-    let messages: Vec<GatewayMessage> = response.json().await?;
-    println!("Backfilling {} recent messages...", messages.len());
+    println!("Backfilling {} recent messages...", collected.len());
 
-    for message in messages.into_iter().rev() {
-        handle_message(&message, Some(channel_id), server_filter, &store).await;
+    for message in collected.into_iter().rev() {
+        handle_message(
+            &message,
+            Some(channel_id),
+            server_filter,
+            &store,
+            quiet,
+        )
+        .await;
     }
 
     let stats = store.lock().await.stats().clone();
     println!(
-        "Backfill done. saved={} training_pairs={} spam={} toxic={} short={}",
+        "Backfill done. seen={} saved={} training_pairs={} spam={} toxic={} short={} duplicates={}",
+        stats.total_seen,
         stats.saved,
         stats.training_pairs_saved,
         stats.skipped_spam,
         stats.skipped_toxic,
-        stats.skipped_too_short
+        stats.skipped_too_short,
+        stats.skipped_duplicate_id + stats.skipped_duplicate_content
     );
 
     Ok(())
