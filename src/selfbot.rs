@@ -311,6 +311,15 @@ async fn handle_message(
         ProcessOutcome::SkippedLowQuality => {
             println!("Skipped low quality message from {}", message.author.username);
         }
+        ProcessOutcome::SkippedSpam => {
+            println!("Skipped spam from {}", message.author.username);
+        }
+        ProcessOutcome::SkippedToxic => {
+            println!("Skipped toxic message from {}", message.author.username);
+        }
+        ProcessOutcome::SkippedTooShort => {
+            println!("Skipped short message from {}", message.author.username);
+        }
         ProcessOutcome::SkippedBot | ProcessOutcome::SkippedEmpty => {}
     }
 }
@@ -347,10 +356,12 @@ async fn backfill_recent_messages(
 
     let stats = store.lock().await.stats().clone();
     println!(
-        "Backfill done. saved={} duplicates={} low_quality={}",
+        "Backfill done. saved={} training_pairs={} spam={} toxic={} short={}",
         stats.saved,
-        stats.skipped_duplicate_id + stats.skipped_duplicate_content,
-        stats.skipped_low_quality
+        stats.training_pairs_saved,
+        stats.skipped_spam,
+        stats.skipped_toxic,
+        stats.skipped_too_short
     );
 
     Ok(())
@@ -359,10 +370,12 @@ async fn backfill_recent_messages(
 fn print_stats(store: &MessageStore) {
     let stats = store.stats();
     println!(
-        "Stats: saved={} duplicates={} low_quality={} total_seen={}",
+        "Stats: saved={} training_pairs={} spam={} toxic={} short={} total_seen={}",
         stats.saved,
-        stats.skipped_duplicate_id + stats.skipped_duplicate_content,
-        stats.skipped_low_quality,
+        stats.training_pairs_saved,
+        stats.skipped_spam,
+        stats.skipped_toxic,
+        stats.skipped_too_short,
         stats.total_seen
     );
 }
